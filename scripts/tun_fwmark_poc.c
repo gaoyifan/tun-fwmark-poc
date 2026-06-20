@@ -734,8 +734,8 @@ static int read_tcp_control_from_tun(int tun_fd, struct tcp_packet *packet,
 	return -1;
 }
 
-static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn,
-				   bool with_mark_prefix)
+static int write_tcp_synack_mss_to_tun(int tun_fd, const struct tcp_packet *syn,
+				       bool with_mark_prefix, uint16_t mss_value)
 {
 	uint8_t packet[20 + 24];
 	uint8_t *ip = packet;
@@ -744,7 +744,7 @@ static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn,
 	size_t total_len = sizeof(packet);
 	uint32_t seq = htonl(TCP_SERVER_SEQ);
 	uint32_t ack = htonl(syn->seq + 1);
-	uint16_t mss = htons(1460);
+	uint16_t mss = htons(mss_value);
 
 	memset(packet, 0, sizeof(packet));
 	ip[0] = 0x45;
@@ -772,6 +772,12 @@ static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn,
 
 	return write_vnet_packet_to_tun(tun_fd, packet, sizeof(packet), &vnet,
 					with_mark_prefix);
+}
+
+static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn,
+				   bool with_mark_prefix)
+{
+	return write_tcp_synack_mss_to_tun(tun_fd, syn, with_mark_prefix, 1460);
 }
 
 static int write_tcp_ack_to_tun(int tun_fd, const struct tcp_packet *data,
@@ -1902,16 +1908,22 @@ static int send_tcp_payload_blocking(int fd, size_t payload_len)
 	return 0;
 }
 
-static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
-				     int iterations, double *gbps)
+static int run_tcp_stream_bench_case(const char *obj_path, bool disable_offloads,
+				     bool prepend_mark, int iterations,
+				     double *gbps)
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
 	struct tcp_packet syn = { 0 };
+	uint32_t mss = prepend_mark ? 1456 : 1460;
 	size_t total_bytes = 0;
-	size_t target_payload = (size_t)iterations * 1460 * 5;
+	size_t target_payload = (size_t)iterations * mss * 5;
 	size_t received_payload = 0;
-	uint64_t start, end;
+	bool debug_tcp = getenv("DEBUG_TCP_STREAM") != NULL;
+	uint32_t last_seq = 0;
+	unsigned int packet_count = 0;
+	unsigned int duplicate_count = 0;
+	uint64_t start, read_done = 0, end;
 	int tun_fd = -1, tcp_fd = -1;
 	int start_pipe[2] = { -1, -1 };
 	pid_t child = -1;
@@ -1919,13 +1931,13 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	int err = -1;
 
 	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = nogso_prepend ? open_vnet_tun_no_offloads(DEV_NAME) :
-				 open_vnet_tun(DEV_NAME);
+	tun_fd = disable_offloads ? open_vnet_tun_no_offloads(DEV_NAME) :
+				    open_vnet_tun(DEV_NAME);
 	if (tun_fd < 0)
 		goto out;
 	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
 		goto out;
-	if (nogso_prepend &&
+	if (prepend_mark &&
 	    attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
 			       &obj, &egress))
 		goto out;
@@ -1933,7 +1945,7 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	tcp_fd = start_marked_tcp_client();
 	if (tcp_fd < 0)
 		goto out;
-	if (nogso_prepend) {
+	if (prepend_mark) {
 		uint32_t payload_len = 0;
 		size_t packet_len = 0;
 
@@ -1944,7 +1956,7 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	} else if (read_tcp_control_from_tun(tun_fd, &syn, 0x02)) {
 		goto out;
 	}
-	if (write_tcp_synack_to_tun(tun_fd, &syn, false))
+	if (write_tcp_synack_mss_to_tun(tun_fd, &syn, false, mss))
 		goto out;
 	if (finish_tcp_connect(tcp_fd))
 		goto out;
@@ -1960,7 +1972,7 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	}
 	if (child == 0) {
 		char token;
-		int rc = send_tcp_payload_blocking(tcp_fd, target_payload);
+		int rc;
 
 		close(start_pipe[1]);
 		if (read(start_pipe[0], &token, 1) != 1)
@@ -1984,7 +1996,7 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 		uint32_t payload_len = 0;
 		size_t packet_len = 0;
 
-		if (nogso_prepend) {
+		if (prepend_mark) {
 			if (read_prepended_tcp_from_tun(tun_fd, EXPECTED_MARK,
 							&data, &payload_len,
 							&packet_len, 0x10, true))
@@ -1997,9 +2009,21 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 		}
 		if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
 			goto out;
+		if (debug_tcp && packet_count < 32) {
+			fprintf(stderr,
+				"TCPDBG prepend=%d t_ms=%.3f seq=%u payload=%u packet_len=%zu flags=0x%02x\n",
+				prepend_mark,
+				(double)(now_ns() - start) / 1000000.0,
+				data.seq, payload_len, packet_len, data.flags);
+		}
+		if (packet_count && data.seq == last_seq)
+			duplicate_count++;
+		last_seq = data.seq;
+		packet_count++;
 		received_payload += payload_len;
 		total_bytes += packet_len;
 	}
+	read_done = now_ns();
 
 	if (waitpid(child, &status, 0) < 0) {
 		perror("waitpid TCP sender");
@@ -2013,6 +2037,17 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	end = now_ns();
 
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	if (debug_tcp)
+		fprintf(stderr,
+			"TCPDBG prepend=%d packets=%u duplicates=%u received_payload=%zu target=%zu total_bytes=%zu elapsed_ms=%.3f\n",
+			prepend_mark, packet_count, duplicate_count,
+			received_payload, target_payload, total_bytes,
+			(double)(end - start) / 1000000.0);
+	if (debug_tcp)
+		fprintf(stderr,
+			"TCPDBG prepend=%d read_ms=%.3f wait_ms=%.3f\n",
+			prepend_mark, (double)(read_done - start) / 1000000.0,
+			(double)(end - read_done) / 1000000.0);
 	err = 0;
 
 out:
@@ -2064,7 +2099,7 @@ static int run_nogso_prepend_bench(const char *obj_path, int iterations)
 		return 1;
 	if (enter_new_netns())
 		return 1;
-	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
+	if (run_tcp_stream_bench_case(obj_path, true, true, iterations, &nogso_tcp))
 		return 1;
 
 	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
@@ -2103,12 +2138,25 @@ static int run_nogso_prepend_tcp_bench(const char *obj_path, int iterations)
 		return 1;
 	if (enter_new_netns())
 		return 1;
-	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
+	if (run_tcp_stream_bench_case(obj_path, true, true, iterations, &nogso_tcp))
 		return 1;
 	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
 	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
 	       base_tcp * 1000.0, nogso_tcp * 1000.0, baseline_iterations,
 	       iterations);
+	return 0;
+}
+
+static int run_tcp_stream_nogso_plain_bench(const char *obj_path, int iterations)
+{
+	double gbps = 0.0;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_stream_bench_case(obj_path, true, false, iterations, &gbps))
+		return 1;
+	printf("BENCH_TCP_STREAM_NOGSO_PLAIN throughput=%.3f Gbit/s mbps=%.2f iterations=%d\n",
+	       gbps, gbps * 1000.0, iterations);
 	return 0;
 }
 
@@ -2225,6 +2273,11 @@ int main(int argc, char **argv)
 		int iterations = argc > 2 ? atoi(argv[2]) : 10;
 
 		return run_nogso_prepend_tcp_bench(obj_path, iterations);
+	}
+	if (argc > 1 && strcmp(argv[1], "--bench-tcp-stream-nogso-plain") == 0) {
+		int iterations = argc > 2 ? atoi(argv[2]) : 10;
+
+		return run_tcp_stream_nogso_plain_bench(obj_path, iterations);
 	}
 	if (argc > 1)
 		obj_path = argv[1];

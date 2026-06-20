@@ -155,16 +155,21 @@ On the development host:
 
 ```text
 BENCH_NOGSO_PREPEND_UDP baseline_gso=4.325 Gbit/s nogso_prepend=7.362 Gbit/s drop=-70.2% iterations=5000
-BENCH_NOGSO_PREPEND_TCP baseline_gso=3.400 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=3400.40 nogso_mbps=0.04 baseline_iterations=2000 nogso_iterations=10
+BENCH_NOGSO_PREPEND_TCP baseline_gso=3.361 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=3361.01 nogso_mbps=0.04 baseline_iterations=2000 nogso_iterations=10
 ```
 
 The UDP number is a local microbenchmark result, not a general claim that
 disabling GSO is faster. In this runner, the GSO side uses `UDP_SEGMENT` cmsg,
 while the no-GSO side sends ordinary UDP datagrams. TCP is the more important
-warning: with TUN offloads disabled, the prepend path degrades to about
-0.04 Mbit/s in this userspace TCP-peer benchmark. The TCP command uses a larger
-GSO baseline iteration count than the no-GSO side because the no-GSO TCP path is
-orders of magnitude slower.
+warning: disabling TUN offloads alone is not what caused the pathological
+result. A diagnostic no-GSO/plain TCP stream reaches about 0.476 Gbit/s for the
+same small stream shape, while no-GSO plus tc egress prepend drops to about
+0.04 Mbit/s. The differentiator is `bpf_skb_adjust_room()` on TCP scalar skbs:
+the PoC observes roughly one TCP segment every 300 ms after prepend. This is
+consistent with the helper's skb head-growth slow path interacting badly with
+TCP skb ownership/TSQ pacing. The TCP command uses a larger GSO baseline
+iteration count than the no-GSO side because the prepend path is orders of
+magnitude slower.
 
 ## Why Not Append To The Tail
 
