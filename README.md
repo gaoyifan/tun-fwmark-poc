@@ -60,9 +60,9 @@ The benchmark runs each case in a fresh network namespace:
 On the development host, 2000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.713 Gbit/s fwmark=2.258 Gbit/s drop=16.8% segments=2000/2000
-BENCH_TCP_GSO baseline=14.491 Gbit/s fwmark=4.349 Gbit/s drop=70.0% bursts=2000/2000 segments=2000
-BENCH_MIXED baseline=4.025 Gbit/s fwmark=2.668 Gbit/s drop=33.7% bursts=4000/4000 segments=6000
+BENCH_UDP_GSO baseline=2.734 Gbit/s fwmark=2.322 Gbit/s drop=15.1% segments=2000/2000
+BENCH_TCP_GSO baseline=14.710 Gbit/s fwmark=7.766 Gbit/s drop=47.2% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=4.263 Gbit/s fwmark=3.204 Gbit/s drop=24.8% bursts=4000/4000 segments=6000
 ```
 
 After adding the Go implementation, the same host produced this C/Go comparison
@@ -70,14 +70,14 @@ with 2000 iterations:
 
 ```text
 C:
-BENCH_UDP_GSO baseline=2.713 Gbit/s fwmark=2.258 Gbit/s drop=16.8% segments=2000/2000
-BENCH_TCP_GSO baseline=14.491 Gbit/s fwmark=4.349 Gbit/s drop=70.0% bursts=2000/2000 segments=2000
-BENCH_MIXED baseline=4.025 Gbit/s fwmark=2.668 Gbit/s drop=33.7% bursts=4000/4000 segments=6000
+BENCH_UDP_GSO baseline=2.734 Gbit/s fwmark=2.322 Gbit/s drop=15.1% segments=2000/2000
+BENCH_TCP_GSO baseline=14.710 Gbit/s fwmark=7.766 Gbit/s drop=47.2% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=4.263 Gbit/s fwmark=3.204 Gbit/s drop=24.8% bursts=4000/4000 segments=6000
 
 Go:
-BENCH_UDP_GSO baseline=13.802 Gbit/s fwmark=6.693 Gbit/s drop=51.5% segments=2000/2000
-BENCH_TCP_GSO baseline=13.508 Gbit/s fwmark=3.611 Gbit/s drop=73.3% bursts=2000/2000 segments=2000
-BENCH_MIXED baseline=10.053 Gbit/s fwmark=3.875 Gbit/s drop=61.5% bursts=4000/4000 segments=6000
+BENCH_UDP_GSO baseline=13.395 Gbit/s fwmark=6.563 Gbit/s drop=51.0% segments=2000/2000
+BENCH_TCP_GSO baseline=13.237 Gbit/s fwmark=6.502 Gbit/s drop=50.9% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=9.642 Gbit/s fwmark=5.611 Gbit/s drop=41.8% bursts=4000/4000 segments=6000
 ```
 
 The Go version uses `github.com/cilium/ebpf`, `github.com/vishvananda/netlink`,
@@ -87,7 +87,9 @@ connection per benchmark case and send many data bursts over it; the earlier
 per-burst connection shape mostly measured `tcp_connect_init()`/SYN setup and
 userspace handshake overhead rather than steady-state TCP GSO transmission. The
 Go benchmark hot path also reuses UDP sockets, control messages, payloads, and
-TUN read buffers.
+TUN read buffers. The synthetic TCP peer writes one cumulative ACK per burst;
+ACKing every scalar MPLS segment made the fwmark TCP side measure userspace ACK
+write overhead in addition to the intended TUN read-path segmentation cost.
 
 On this TUN device, MPLS packets are software-segmented before userspace reads
 them because TUN does not advertise MPLS TSO/USO features through

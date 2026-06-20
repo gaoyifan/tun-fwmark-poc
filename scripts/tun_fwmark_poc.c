@@ -1268,6 +1268,8 @@ static int run_tcp_bench_conn_burst(int tun_fd, struct tcp_bench_conn *conn,
 	if (conn->with_mpls) {
 		size_t received_payload = 0;
 		size_t total_packet_len = 0;
+		struct tcp_packet last_data = { 0 };
+		uint32_t last_payload_len = 0;
 
 		while (received_payload < 1460 * 5) {
 			size_t one_packet_len = 0;
@@ -1276,11 +1278,13 @@ static int run_tcp_bench_conn_burst(int tun_fd, struct tcp_bench_conn *conn,
 						   &data, &payload_len,
 						   &one_packet_len, 0x10, true))
 				return -1;
-			if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
-				return -1;
+			last_data = data;
+			last_payload_len = payload_len;
 			received_payload += payload_len;
 			total_packet_len += one_packet_len - 4;
 		}
+		if (write_tcp_ack_to_tun(tun_fd, &last_data, last_payload_len))
+			return -1;
 		*packet_len = total_packet_len;
 	} else {
 		if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size,

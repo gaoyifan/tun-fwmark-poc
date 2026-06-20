@@ -1190,17 +1190,21 @@ func (c *tcpBenchConn) sendBurst() (int, error) {
 	if c.withMPLS {
 		receivedPayload := uint32(0)
 		totalLen := 0
+		var lastData tcpPacket
+		var lastPayloadLen uint32
 		for receivedPayload < 1460*5 {
 			var data tcpPacket
 			payloadLen, oneLen, err := readMPLSTCPFromTun(c.tunFD, expectedMark, &data, 0x10, true)
 			if err != nil {
 				return 0, err
 			}
-			if err := writeTCPAckToTun(c.tunFD, &data, payloadLen); err != nil {
-				return 0, err
-			}
+			lastData = data
+			lastPayloadLen = payloadLen
 			receivedPayload += payloadLen
 			totalLen += oneLen - 4
+		}
+		if err := writeTCPAckToTun(c.tunFD, &lastData, lastPayloadLen); err != nil {
+			return 0, err
 		}
 		return totalLen, nil
 	}

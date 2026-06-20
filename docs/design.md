@@ -107,6 +107,13 @@ for every burst. That mostly measured connection setup work in
 also made TCP look much slower than UDP, whose benchmark already reused a socket
 and sent steady-state UDP GSO datagrams.
 
+For the MPLS TCP path, the synthetic peer reads all scalar MPLS segments for one
+burst and then writes one cumulative ACK. ACKing every scalar segment distorted
+the result by adding one userspace TUN write per segment. After this correction,
+the remaining TCP fwmark drop is dominated by the loss of TUN GSO on MPLS: a
+baseline TCP burst is read as one GSO packet, while the MPLS/fwmark side must
+read multiple scalar segments for the same burst.
+
 ## Rejected Alternatives
 
 ### Direct eBPF Prepend On Read Path
