@@ -96,14 +96,16 @@ make bench-nogso-prepend-tcp
 On the development host:
 
 ```text
-BENCH_NOGSO_PREPEND_UDP baseline_gso=4.351 Gbit/s nogso_prepend=7.292 Gbit/s drop=-67.6% iterations=5000
-BENCH_NOGSO_PREPEND_TCP baseline_gso=0.468 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=467.58 nogso_mbps=0.04 iterations=10
+BENCH_NOGSO_PREPEND_UDP baseline_gso=4.325 Gbit/s nogso_prepend=7.362 Gbit/s drop=-70.2% iterations=5000
+BENCH_NOGSO_PREPEND_TCP baseline_gso=3.400 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=3400.40 nogso_mbps=0.04 baseline_iterations=2000 nogso_iterations=10
 ```
 
 The UDP result is specific to this local microbenchmark: no-GSO sends three
 ordinary UDP datagrams, while the GSO baseline uses `UDP_SEGMENT` cmsg. The TCP
 result shows the riskier case: once TUN GSO is removed, the scalar prepend path
-collapses in this userspace TCP-peer benchmark.
+collapses in this userspace TCP-peer benchmark. The TCP command uses a larger
+GSO baseline iteration count than the no-GSO side because the no-GSO TCP path is
+orders of magnitude slower.
 
 ## Files
 

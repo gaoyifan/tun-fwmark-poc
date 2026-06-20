@@ -154,15 +154,17 @@ The comparison is:
 On the development host:
 
 ```text
-BENCH_NOGSO_PREPEND_UDP baseline_gso=4.351 Gbit/s nogso_prepend=7.292 Gbit/s drop=-67.6% iterations=5000
-BENCH_NOGSO_PREPEND_TCP baseline_gso=0.468 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=467.58 nogso_mbps=0.04 iterations=10
+BENCH_NOGSO_PREPEND_UDP baseline_gso=4.325 Gbit/s nogso_prepend=7.362 Gbit/s drop=-70.2% iterations=5000
+BENCH_NOGSO_PREPEND_TCP baseline_gso=3.400 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=3400.40 nogso_mbps=0.04 baseline_iterations=2000 nogso_iterations=10
 ```
 
 The UDP number is a local microbenchmark result, not a general claim that
 disabling GSO is faster. In this runner, the GSO side uses `UDP_SEGMENT` cmsg,
 while the no-GSO side sends ordinary UDP datagrams. TCP is the more important
 warning: with TUN offloads disabled, the prepend path degrades to about
-0.04 Mbit/s in this userspace TCP-peer benchmark.
+0.04 Mbit/s in this userspace TCP-peer benchmark. The TCP command uses a larger
+GSO baseline iteration count than the no-GSO side because the no-GSO TCP path is
+orders of magnitude slower.
 
 ## Why Not Append To The Tail
 

@@ -1913,6 +1913,7 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 	size_t received_payload = 0;
 	uint64_t start, end;
 	int tun_fd = -1, tcp_fd = -1;
+	int start_pipe[2] = { -1, -1 };
 	pid_t child = -1;
 	int status = 0;
 	int err = -1;
@@ -1947,18 +1948,36 @@ static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
 		goto out;
 	if (finish_tcp_connect(tcp_fd))
 		goto out;
+	if (pipe(start_pipe) < 0) {
+		perror("pipe TCP sender");
+		goto out;
+	}
 
-	start = now_ns();
 	child = fork();
 	if (child < 0) {
 		perror("fork TCP sender");
 		goto out;
 	}
 	if (child == 0) {
+		char token;
 		int rc = send_tcp_payload_blocking(tcp_fd, target_payload);
 
+		close(start_pipe[1]);
+		if (read(start_pipe[0], &token, 1) != 1)
+			_exit(1);
+		close(start_pipe[0]);
+		rc = send_tcp_payload_blocking(tcp_fd, target_payload);
 		_exit(rc ? 1 : 0);
 	}
+	close(start_pipe[0]);
+	start_pipe[0] = -1;
+	start = now_ns();
+	if (write(start_pipe[1], "x", 1) != 1) {
+		perror("start TCP sender");
+		goto out;
+	}
+	close(start_pipe[1]);
+	start_pipe[1] = -1;
 
 	while (received_payload < target_payload) {
 		struct tcp_packet data = { 0 };
@@ -2001,6 +2020,10 @@ out:
 		kill(child, SIGKILL);
 		waitpid(child, NULL, 0);
 	}
+	if (start_pipe[0] >= 0)
+		close(start_pipe[0]);
+	if (start_pipe[1] >= 0)
+		close(start_pipe[1]);
 	if (tcp_fd >= 0)
 		close(tcp_fd);
 	if (obj) {
@@ -2031,18 +2054,23 @@ static int run_nogso_prepend_bench(const char *obj_path, int iterations)
 	printf("BENCH_NOGSO_PREPEND_UDP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
 	       base_udp, nogso_udp, drop_percent(base_udp, nogso_udp), iterations);
 
+	int tcp_baseline_iterations = iterations < 2000 ? 2000 : iterations;
+
 	if (enter_new_netns())
 		return 1;
-	if (run_tcp_stream_bench_case(obj_path, false, iterations, &base_tcp))
+	if (run_tcp_gso_bench_case(obj_path, false, tcp_baseline_iterations,
+				   &base_tcp, &(unsigned int){ 0 },
+				   &(unsigned int){ 0 }))
 		return 1;
 	if (enter_new_netns())
 		return 1;
 	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
 		return 1;
 
-	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f iterations=%d\n",
+	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
 	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
-	       base_tcp * 1000.0, nogso_tcp * 1000.0, iterations);
+	       base_tcp * 1000.0, nogso_tcp * 1000.0, tcp_baseline_iterations,
+	       iterations);
 	return 0;
 }
 
@@ -2066,18 +2094,21 @@ static int run_nogso_prepend_udp_bench(const char *obj_path, int iterations)
 static int run_nogso_prepend_tcp_bench(const char *obj_path, int iterations)
 {
 	double base_tcp = 0.0, nogso_tcp = 0.0;
+	int baseline_iterations = iterations < 2000 ? 2000 : iterations;
 
 	if (enter_new_netns())
 		return 1;
-	if (run_tcp_stream_bench_case(obj_path, false, iterations, &base_tcp))
+	if (run_tcp_gso_bench_case(obj_path, false, baseline_iterations, &base_tcp,
+				   &(unsigned int){ 0 }, &(unsigned int){ 0 }))
 		return 1;
 	if (enter_new_netns())
 		return 1;
 	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
 		return 1;
-	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f iterations=%d\n",
+	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
 	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
-	       base_tcp * 1000.0, nogso_tcp * 1000.0, iterations);
+	       base_tcp * 1000.0, nogso_tcp * 1000.0, baseline_iterations,
+	       iterations);
 	return 0;
 }
 
