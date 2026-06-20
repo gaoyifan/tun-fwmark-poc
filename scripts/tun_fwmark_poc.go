@@ -1029,16 +1029,16 @@ type udpSender struct {
 	oob  []byte
 }
 
-func newUDPSender(mark uint32, gsoSize uint16) (*udpSender, error) {
+func newUDPSender(mark uint32, gsoSize uint16) (udpSender, error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("socket UDP: %w", err)
+		return udpSender{fd: -1}, fmt.Errorf("socket UDP: %w", err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, int(mark)); err != nil {
 		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt UDP SO_MARK: %w", err)
+		return udpSender{fd: -1}, fmt.Errorf("setsockopt UDP SO_MARK: %w", err)
 	}
-	s := &udpSender{
+	s := udpSender{
 		fd:   fd,
 		addr: unix.SockaddrInet4{Port: 5555, Addr: [4]byte{10, 99, 0, 2}},
 	}
@@ -1054,7 +1054,7 @@ func newUDPSender(mark uint32, gsoSize uint16) (*udpSender, error) {
 }
 
 func (s *udpSender) close() {
-	if s != nil && s.fd >= 0 {
+	if s.fd >= 0 {
 		_ = unix.Close(s.fd)
 		s.fd = -1
 	}
@@ -1141,7 +1141,11 @@ func runUDPGSOBenchCase(objPath string, withMPLS bool, iterations int) (float64,
 		}
 	}
 	elapsed := time.Since(start).Nanoseconds()
-	return float64(totalBytes) * 8.0 / float64(elapsed), uint(map[bool]int{true: iterations, false: 0}[withMPLS]), nil
+	bursts := uint(0)
+	if withMPLS {
+		bursts = uint(iterations)
+	}
+	return float64(totalBytes) * 8.0 / float64(elapsed), bursts, nil
 }
 
 type tcpBenchConn struct {
