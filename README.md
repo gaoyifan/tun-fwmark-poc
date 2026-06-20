@@ -1,41 +1,79 @@
 # TUN fwmark PoC
 
-This repository keeps two small PoCs for passing Linux `skb->mark` across a
-TUN device boundary.
+This repository contains one Linux-only PoC for carrying `skb->mark` across a
+TUN userspace boundary without breaking TUN GSO/GRO behavior.
 
-TUN does not expose `skb->mark` through its native PI header. The scripts keep
-the TUN device in PI mode and use tc eBPF to add or remove a 4-byte big-endian
-fwmark prefix immediately before the IPv4 packet.
+The PoC uses a PI-mode `IFF_VNET_HDR` TUN device:
 
-## PoCs
+- **TUN Write Path**: userspace writes `tun_pi + virtio_net_hdr + mark + packet`.
+  A tc ingress BPF program reads the 4-byte big-endian mark, assigns it to
+  `skb->mark`, strips the mark bytes, and lets the clean packet enter the kernel
+  stack.
+- **TUN Read Path**: tc egress BPF does not modify packet bytes. It emits one
+  ringbuf metadata event per skb/super-packet containing `skb->mark`, `len`,
+  `gso_size`, and `gso_segs`. Userspace reads the normal TUN packet and consumes
+  the matching metadata event out of band.
 
-- Ingress, user writes to TUN: userspace writes `tun_pi + mark + ipv4_packet`.
-  A tc ingress classifier reads the first 4 bytes after the PI header, assigns
-  the value to `skb->mark`, strips those 4 bytes, and lets a clean IPv4 packet
-  continue through the network stack.
-- Egress, user reads from TUN: a marked socket sends a packet routed to the TUN
-  device. A tc egress classifier prepends the packet's `skb->mark`, so userspace
-  reads `tun_pi + mark + ipv4_packet`.
+This avoids the failed designs:
+
+- prepending mark bytes on tc egress can break TCP/GSO packets because it changes
+  protocol header offsets before TUN serializes the virtio header;
+- appending mark bytes with `bpf_skb_change_tail()` is also unsuitable because
+  that helper linearizes the skb and drops offload state.
 
 ## Run
 
 ```sh
-./run_poc.sh
+make test
 ```
 
-The script uses temporary network namespaces and will re-exec through `sudo`
-when needed.
+The test requires `sudo -n` for TUN, tc BPF, and `SO_MARK`.
 
-Expected result:
+Expected output:
 
 ```text
-PASS: ingress imports fwmark from a 4-byte prefix; egress exports skb mark as a 4-byte prefix
+WRITE_PATH: imported mark=0x00000042 ...
+WRITE_PATH_UDP_GSO: imported mark=0x00000042 ... gso_size=1200
+READ_PATH_UDP_SCALAR: event mark=0x00000043 ...
+READ_PATH_ZERO_MARK: event mark=0x00000000 ...
+READ_PATH_UDP: event mark=0x00000042 ... gso_size=1200 gso_segs=3
+READ_PATH_TCP: event mark=0x00000042 ... gso_size=1460 gso_segs=5
+PASS: TUN write path imports fwmark; TUN read path exports fwmark out-of-band while preserving UDP and TCP GSO super-packets
 ```
+
+For a simple read-path UDP GSO baseline comparison:
+
+```sh
+make bench
+```
+
+On the development host, 10000 UDP GSO super-packets produced:
+
+```text
+BENCH_UDP_GSO baseline=2.650 Gbit/s fwmark=2.120 Gbit/s drop=20.0% events=10000/10000
+```
+
+This benchmark measures the side-channel cost in the PoC runner, including
+ringbuf polling and userspace validation. It is intended as a regression/stress
+check, not a tuned maximum-throughput benchmark.
+
+## Files
+
+- `bpf/tun_fwmark.bpf.c`: tc ingress/write-path mark import and tc
+  egress/read-path metadata export.
+- `scripts/tun_fwmark_poc.c`: creates a temporary PI+VNET TUN, attaches the BPF
+  programs, sends test traffic, reads TUN packets, and verifies ringbuf events.
+- `docs/design.md`: technical design notes, rejected alternatives, and
+  limitations.
 
 ## Notes
 
-- PI mode is intentional. With `IFF_NO_PI`, TUN validates the first byte as the
-  IP version, so a raw 4-byte mark prefix is rejected before tc can fix it.
-- `SO_RCVMARK` does not work on a TUN file descriptor because it is not a socket.
-- The eBPF programs use `BPF_ADJ_ROOM_MAC`; for TUN skbs this adjusts the data
-  location that tc sees before the IP header.
+- PI mode is intentional. With `IFF_NO_PI`, TUN validates the first byte after
+  the virtio header as an IP version, so a raw 4-byte mark prefix can be rejected
+  before tc ingress gets a chance to strip it.
+- `SO_RCVMARK` is not available on a TUN file descriptor because the fd is a
+  character device from userspace's point of view.
+- The read-path side channel exports one mark per skb. For a GSO super-packet
+  that is the correct granularity: the whole skb has one `skb->mark`.
+- The event includes L4 protocol and ports so userspace can distinguish real
+  data events from control traffic such as ICMP errors, especially for mark `0`.
