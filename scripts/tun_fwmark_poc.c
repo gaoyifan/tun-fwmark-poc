@@ -41,6 +41,9 @@ struct fwmark_event {
 	uint32_t direction;
 	uint32_t ifindex;
 	uint32_t queue_mapping;
+	uint32_t ip_saddr;
+	uint32_t ip_daddr;
+	uint32_t ip_id;
 	uint32_t mark;
 	uint32_t len;
 	uint32_t hash;
@@ -50,6 +53,19 @@ struct fwmark_event {
 	uint32_t ip_proto;
 	uint32_t sport;
 	uint32_t dport;
+	uint32_t l4_cookie;
+};
+
+struct packet_meta {
+	uint32_t len;
+	uint32_t gso_size;
+	uint32_t ip_proto;
+	uint32_t sport;
+	uint32_t dport;
+	uint32_t ip_saddr;
+	uint32_t ip_daddr;
+	uint32_t ip_id;
+	uint32_t l4_cookie;
 };
 
 struct event_state {
@@ -101,6 +117,66 @@ static uint16_t csum16(const void *data, size_t len)
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
 	return (uint16_t)~sum;
+}
+
+static int parse_tun_packet_meta(const uint8_t *buf, ssize_t len,
+				 struct packet_meta *meta)
+{
+	const struct virtio_net_hdr *hdr = (const struct virtio_net_hdr *)(buf + 4);
+	const uint8_t *ip = buf + 4 + sizeof(*hdr);
+	const uint8_t *l4;
+	uint8_t ihl;
+
+	if (!meta)
+		return 0;
+	memset(meta, 0, sizeof(*meta));
+	if (len < 4 + (ssize_t)sizeof(*hdr) + 20)
+		return -1;
+	if ((ip[0] >> 4) != 4)
+		return -1;
+
+	ihl = (ip[0] & 0x0f) * 4;
+	if (ihl < 20 || len < 4 + (ssize_t)sizeof(*hdr) + ihl)
+		return -1;
+	l4 = ip + ihl;
+
+	meta->len = (uint32_t)(len - 4 - sizeof(*hdr));
+	meta->gso_size = hdr->gso_size;
+	meta->ip_proto = ip[9];
+	meta->ip_id = ((uint16_t)ip[4] << 8) | ip[5];
+	memcpy(&meta->ip_saddr, ip + 12, sizeof(meta->ip_saddr));
+	memcpy(&meta->ip_daddr, ip + 16, sizeof(meta->ip_daddr));
+
+	if ((meta->ip_proto == IPPROTO_TCP || meta->ip_proto == IPPROTO_UDP) &&
+	    len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 4) {
+		meta->sport = ((uint16_t)l4[0] << 8) | l4[1];
+		meta->dport = ((uint16_t)l4[2] << 8) | l4[3];
+		if (meta->ip_proto == IPPROTO_TCP &&
+		    len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 8) {
+			uint32_t seq;
+
+			memcpy(&seq, l4 + 4, sizeof(seq));
+			meta->l4_cookie = ntohl(seq);
+		} else if (meta->ip_proto == IPPROTO_UDP &&
+			 len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 6)
+			meta->l4_cookie = ((uint16_t)l4[4] << 8) | l4[5];
+	}
+
+	return 0;
+}
+
+static bool event_matches_packet(const struct fwmark_event *event,
+				 const struct packet_meta *meta)
+{
+	return event->len == meta->len &&
+	       event->gso_size == meta->gso_size &&
+	       event->ip_proto == meta->ip_proto &&
+	       event->sport == meta->sport &&
+	       event->dport == meta->dport &&
+	       event->ip_saddr == meta->ip_saddr &&
+	       event->ip_daddr == meta->ip_daddr &&
+	       event->ip_id == meta->ip_id &&
+	       event->l4_cookie == meta->l4_cookie;
 }
 
 static int open_vnet_tun(const char *name)
@@ -306,6 +382,46 @@ static int attach_read_bpf(const char *dev, const char *obj_path,
 err_close:
 	bpf_object__close(obj);
 	return -1;
+}
+
+static uint64_t read_drop_count(struct bpf_object *obj)
+{
+	struct bpf_map *map = bpf_object__find_map_by_name(obj, "fwmark_event_drops");
+	unsigned int nr_cpus;
+	uint64_t *values;
+	uint64_t total = 0;
+	uint32_t key = 0;
+
+	if (!map)
+		return UINT64_MAX;
+	nr_cpus = libbpf_num_possible_cpus();
+	values = calloc(nr_cpus, sizeof(*values));
+	if (!values)
+		return UINT64_MAX;
+	if (bpf_map_lookup_elem(bpf_map__fd(map), &key, values) < 0) {
+		free(values);
+		return UINT64_MAX;
+	}
+	for (unsigned int i = 0; i < nr_cpus; i++)
+		total += values[i];
+	free(values);
+	return total;
+}
+
+static int assert_no_drops(struct bpf_object *obj)
+{
+	uint64_t drops = read_drop_count(obj);
+
+	if (drops == UINT64_MAX) {
+		fprintf(stderr, "failed to read ringbuf drop counter\n");
+		return -1;
+	}
+	if (drops) {
+		fprintf(stderr, "ringbuf metadata drops: %llu\n",
+			(unsigned long long)drops);
+		return -1;
+	}
+	return 0;
 }
 
 static int handle_event(void *ctx, void *data, size_t len)
@@ -829,7 +945,8 @@ static int send_udp_datagram(uint32_t mark, size_t payload_len)
 	return ret < 0 ? -1 : 0;
 }
 
-static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len)
+static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
+				    struct packet_meta *meta)
 {
 	uint8_t buf[2048];
 
@@ -852,6 +969,8 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len)
 			continue;
 		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_UDP)
 			continue;
+		if (parse_tun_packet_meta(buf, n, meta))
+			continue;
 		*packet_len = (size_t)n;
 		return 0;
 	}
@@ -861,7 +980,8 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len)
 }
 
 static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
-			     size_t *packet_len, uint16_t *gso_size)
+			     size_t *packet_len, uint16_t *gso_size,
+			     struct packet_meta *meta)
 {
 	uint8_t buf[8192];
 	uint8_t last_gso_type = 0;
@@ -885,6 +1005,8 @@ static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
 		last_gso_size = hdr->gso_size;
 		if (hdr->gso_type != expected_gso_type)
 			continue;
+		if (parse_tun_packet_meta(buf, n, meta))
+			continue;
 		*packet_len = (size_t)n;
 		*gso_size = hdr->gso_size;
 		return 0;
@@ -898,7 +1020,8 @@ static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
 static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
 				      uint16_t *gso_size,
 				      struct tcp_packet *packet,
-				      uint32_t *payload_len)
+				      uint32_t *payload_len,
+				      struct packet_meta *meta)
 {
 	uint8_t buf[8192];
 	uint8_t last_gso_type = 0;
@@ -936,6 +1059,8 @@ static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
 		thl = (tcp[12] >> 4) * 4;
 		total_len = ((uint16_t)ip[2] << 8) | ip[3];
 		if (thl < 20 || total_len < ihl + thl)
+			continue;
+		if (parse_tun_packet_meta(buf, n, meta))
 			continue;
 
 		memcpy(&packet->saddr, ip + 12, sizeof(packet->saddr));
@@ -1005,7 +1130,7 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 		if (with_bpf && poll_until_read_events(rb, &state, i + 1))
 			goto out;
 		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-				      &packet_len, &gso_size))
+				      &packet_len, &gso_size, NULL))
 			goto out;
 		total_bytes += packet_len;
 	}
@@ -1013,6 +1138,8 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
 	*events = state.read_events;
+	if (with_bpf && assert_no_drops(obj))
+		goto out;
 	err = 0;
 
 out:
@@ -1055,7 +1182,7 @@ static int run_tcp_gso_burst(int tun_fd, struct ring_buffer *rb,
 	if (rb && poll_until_read_events(rb, state, expected_gso_events))
 		goto out;
 	if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size, &data,
-				       &payload_len))
+				       &payload_len, NULL))
 		goto out;
 	if (!gso_size) {
 		fprintf(stderr, "unexpected TCP benchmark GSO size: %u\n", gso_size);
@@ -1118,6 +1245,8 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_bpf,
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
 	*gso_events = state.read_events;
 	*total_events = state.total_read_events;
+	if (with_bpf && assert_no_drops(obj))
+		goto out;
 	err = 0;
 
 out:
@@ -1176,7 +1305,7 @@ static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
 			goto out;
 		if (rb)
 			ring_buffer__poll(rb, 0);
-		if (read_udp_scalar_from_tun(tun_fd, &packet_len))
+		if (read_udp_scalar_from_tun(tun_fd, &packet_len, NULL))
 			goto out;
 		total_bytes += packet_len;
 
@@ -1185,7 +1314,7 @@ static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
 		if (rb && poll_until_read_events(rb, &state, (i * 2) + 1))
 			goto out;
 		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-				      &packet_len, &gso_size))
+				      &packet_len, &gso_size, NULL))
 			goto out;
 		total_bytes += packet_len;
 
@@ -1199,6 +1328,8 @@ static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
 	*gso_events = state.read_events;
 	*total_events = state.total_read_events;
+	if (with_bpf && assert_no_drops(obj))
+		goto out;
 	err = 0;
 
 out:
@@ -1299,6 +1430,8 @@ int main(int argc, char **argv)
 	struct ring_buffer *rb = NULL;
 	struct event_state state = { 0 };
 	struct bpf_map *map;
+	struct packet_meta scalar_meta = { 0 }, zero_meta = { 0 };
+	struct packet_meta udp_gso_meta = { 0 }, tcp_gso_meta = { 0 };
 	struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
 	struct tcp_packet syn = { 0 };
 	size_t scalar_packet_len = 0, zero_packet_len = 0;
@@ -1361,8 +1494,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "read-path scalar fwmark event not received\n");
 		goto out;
 	}
-	if (read_udp_scalar_from_tun(tun_fd, &scalar_packet_len))
+	if (read_udp_scalar_from_tun(tun_fd, &scalar_packet_len, &scalar_meta))
 		goto out;
+	if (!event_matches_packet(&state.scalar_event, &scalar_meta)) {
+		fprintf(stderr, "read-path scalar metadata mismatch\n");
+		goto out;
+	}
 
 	if (send_udp_datagram(0, 32))
 		goto out;
@@ -1370,8 +1507,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "read-path zero-mark event not received\n");
 		goto out;
 	}
-	if (read_udp_scalar_from_tun(tun_fd, &zero_packet_len))
+	if (read_udp_scalar_from_tun(tun_fd, &zero_packet_len, &zero_meta))
 		goto out;
+	if (!event_matches_packet(&state.zero_event, &zero_meta)) {
+		fprintf(stderr, "read-path zero-mark metadata mismatch\n");
+		goto out;
+	}
 
 	if (send_marked_udp_gso())
 		goto out;
@@ -1380,8 +1521,13 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-			      &udp_gso_packet_len, &udp_tun_gso_size)) {
+			      &udp_gso_packet_len, &udp_tun_gso_size,
+			      &udp_gso_meta)) {
 		fprintf(stderr, "UDP GSO TUN read failed\n");
+		goto out;
+	}
+	if (!event_matches_packet(&state.udp_read_event, &udp_gso_meta)) {
+		fprintf(stderr, "read-path UDP GSO metadata mismatch\n");
 		goto out;
 	}
 	if (udp_tun_gso_size != GSO_SIZE) {
@@ -1405,14 +1551,26 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_TCPV4,
-			      &tcp_gso_packet_len, &tcp_tun_gso_size)) {
+			      &tcp_gso_packet_len, &tcp_tun_gso_size,
+			      &tcp_gso_meta)) {
 		fprintf(stderr, "TCP GSO TUN read failed\n");
+		goto out;
+	}
+	if (!event_matches_packet(&state.tcp_read_event, &tcp_gso_meta)) {
+		fprintf(stderr, "read-path TCP GSO metadata mismatch\n");
+		goto out;
+	}
+	if (event_matches_packet(&state.udp_read_event, &tcp_gso_meta) ||
+	    event_matches_packet(&state.tcp_read_event, &udp_gso_meta)) {
+		fprintf(stderr, "metadata mismatch detector accepted crossed events\n");
 		goto out;
 	}
 	if (!tcp_tun_gso_size) {
 		fprintf(stderr, "unexpected TCP TUN GSO size: %u\n", tcp_tun_gso_size);
 		goto out;
 	}
+	if (assert_no_drops(obj))
+		goto out;
 
 	printf("WRITE_PATH: imported mark=0x%08x len=%u\n",
 	       state.write_event.mark, state.write_event.len);

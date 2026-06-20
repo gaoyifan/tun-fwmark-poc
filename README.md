@@ -11,9 +11,10 @@ The PoC uses a PI-mode `IFF_VNET_HDR` TUN device:
   stack.
 - **TUN Read Path**: tc egress BPF does not modify packet bytes. It emits one
   ringbuf metadata event per skb/super-packet containing `skb->mark`, `len`,
-  `gso_size`, `gso_segs`, and `queue_mapping`. Userspace reads the normal TUN
-  packet and consumes the matching metadata event out of band. The intended
-  matching model is FIFO per TUN queue.
+  `gso_size`, `gso_segs`, `queue_mapping`, and a packet fingerprint. Userspace
+  reads the normal TUN packet and consumes the matching metadata event out of
+  band. The intended matching model is FIFO per TUN queue, with the fingerprint
+  used to detect desynchronization.
 
 This avoids the failed designs:
 
@@ -57,9 +58,9 @@ The benchmark runs each case in a fresh network namespace:
 On the development host, 5000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.648 Gbit/s fwmark=2.183 Gbit/s drop=17.5% events=5000/5000
-BENCH_TCP_GSO baseline=3.301 Gbit/s fwmark=2.703 Gbit/s drop=18.1% gso_events=5000/5000 total_events=19999
-BENCH_MIXED baseline=2.430 Gbit/s fwmark=1.977 Gbit/s drop=18.6% gso_events=10000/10000 total_events=30445
+BENCH_UDP_GSO baseline=2.663 Gbit/s fwmark=2.054 Gbit/s drop=22.9% events=5000/5000
+BENCH_TCP_GSO baseline=3.296 Gbit/s fwmark=2.546 Gbit/s drop=22.8% gso_events=5000/5000 total_events=19999
+BENCH_MIXED baseline=2.363 Gbit/s fwmark=1.856 Gbit/s drop=21.5% gso_events=10000/10000 total_events=30741
 ```
 
 This measures the side-channel cost in the PoC runner, including ringbuf

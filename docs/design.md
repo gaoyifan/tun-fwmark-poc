@@ -66,7 +66,8 @@ GSO super-packets, it emits one ringbuf event:
 
 ```text
 direction, ifindex, queue_mapping, skb->mark, skb->len, skb->hash, gso_size,
-gso_segs, eth protocol, L4 protocol, source port, destination port
+gso_segs, eth protocol, L4 protocol, source port, destination port,
+IP source, IP destination, IP ID, L4 cookie
 ```
 
 Userspace reads the TUN fd normally and consumes the matching metadata event out
@@ -90,15 +91,19 @@ The robust production shape is still simple:
    packet from that TUN queue;
 3. treat a missing metadata event, an empty FIFO, or a full bounded FIFO as
    desynchronization for that queue;
-4. use `len`, `gso_size`, L4 protocol, and ports as cheap sanity checks and for
-   resynchronization.
+4. compare the metadata fingerprint with the actual TUN packet.
 
-This avoids expensive per-packet locking in the BPF hot path. If a production
-implementation needs explicit loss accounting, add a lightweight per-CPU drop
-counter for ringbuf reservation failures and make the userspace dispatcher check
-it periodically. A strict per-queue sequence number is possible, but doing it
-with a shared BPF counter needs synchronization and was measurably heavier in
-mixed traffic than the FIFO-plus-drop-counter shape.
+The fingerprint is intentionally cheap: packet length, GSO size, IP protocol,
+ports, IPv4 source/destination, IPv4 ID, and an L4 cookie. The L4 cookie is TCP
+sequence number for TCP and UDP length for UDP. This is not a cryptographic
+identity, but it catches the important mismatch classes without modifying packet
+bytes or adding per-packet BPF locking.
+
+The BPF program also maintains a per-CPU drop counter for ringbuf reservation
+failures. The PoC asserts that this counter remains zero during tests and
+benchmarks. A strict per-queue sequence number is possible, but doing it with a
+shared BPF counter needs synchronization and was measurably heavier in mixed
+traffic than the FIFO-plus-fingerprint-plus-drop-counter shape.
 
 For a GSO super-packet this is the correct granularity: the whole skb has one
 `skb->mark`, so one metadata event per skb/super-packet is enough. The packet
@@ -135,8 +140,8 @@ The ringbuf side channel is cleaner.
 - FIFO matching assumes packets are not dropped after the tc egress hook has
   emitted metadata and that ringbuf events are not lost. Production code should
   count ringbuf drops, use bounded metadata FIFOs, size the TUN queue/ringbuf
-  conservatively, and use the L4 metadata as a sanity check or resynchronization
-  hint.
+  conservatively, and treat fingerprint mismatch as a queue-level
+  desynchronization signal.
 - Ringbuf overflow means metadata loss. A production implementation needs
   counters and a resynchronization policy.
 - The PoC verifies UDP GSO with `UDP_SEGMENT` and TCP GSO with a minimal TCP
@@ -191,15 +196,17 @@ It covers:
 On the development host, 5000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.648 Gbit/s fwmark=2.183 Gbit/s drop=17.5% events=5000/5000
-BENCH_TCP_GSO baseline=3.301 Gbit/s fwmark=2.703 Gbit/s drop=18.1% gso_events=5000/5000 total_events=19999
-BENCH_MIXED baseline=2.430 Gbit/s fwmark=1.977 Gbit/s drop=18.6% gso_events=10000/10000 total_events=30445
+BENCH_UDP_GSO baseline=2.663 Gbit/s fwmark=2.054 Gbit/s drop=22.9% events=5000/5000
+BENCH_TCP_GSO baseline=3.296 Gbit/s fwmark=2.546 Gbit/s drop=22.8% gso_events=5000/5000 total_events=19999
+BENCH_MIXED baseline=2.363 Gbit/s fwmark=1.856 Gbit/s drop=21.5% gso_events=10000/10000 total_events=30741
 ```
 
 The GSO event count is part of the assertion. A mismatch fails the benchmark,
 which catches ringbuf/event loss under this stress workload. `total_events`
 includes scalar TCP control packets such as SYN, ACK, and FIN, so it is expected
 to be higher than the GSO data event count for TCP and mixed cases.
+The functional test also verifies that valid metadata matches the actual TUN
+packet fingerprint and that crossed UDP/TCP metadata is rejected as a mismatch.
 
 These numbers are PoC-runner numbers. They include ringbuf polling, userspace
 event validation, socket setup for short TCP bursts, and the minimal TCP peer's
