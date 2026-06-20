@@ -62,12 +62,23 @@ struct mpls_packet_meta {
 	struct packet_meta packet;
 };
 
+struct udp_sender {
+	int fd;
+	struct sockaddr_in dst;
+	char control[CMSG_SPACE(sizeof(uint16_t))];
+	size_t control_len;
+};
+
 struct tc_attachment {
 	struct bpf_tc_hook hook;
 	struct bpf_tc_opts opts;
 };
 
 static int enter_new_netns(void);
+
+static char udp_bench_gso_payload[GSO_SIZE * 3];
+static char udp_bench_scalar_payload[512];
+static bool udp_bench_payloads_ready;
 
 static void run_cmd_quiet(const char *cmd)
 {
@@ -806,94 +817,117 @@ static int send_tcp_payload(int fd)
 	return send_tcp_payload_len(fd, 1460 * 5);
 }
 
-static int send_marked_udp_gso(void)
+static void init_udp_bench_payloads(void)
 {
-	char payload[GSO_SIZE * 3] = { 0 };
-	char control[CMSG_SPACE(sizeof(uint16_t))] = { 0 };
-	struct sockaddr_in dst = { 0 };
-	struct msghdr msg = { 0 };
-	struct cmsghdr *cmsg;
-	struct iovec iov;
-	uint16_t gso_size = GSO_SIZE;
-	uint32_t mark = EXPECTED_MARK;
-	int fd, ret;
+	if (udp_bench_payloads_ready)
+		return;
+	for (size_t i = 0; i < sizeof(udp_bench_gso_payload); i++)
+		udp_bench_gso_payload[i] = (char)('a' + (i % 26));
+	memset(udp_bench_scalar_payload, 'U', sizeof(udp_bench_scalar_payload));
+	udp_bench_payloads_ready = true;
+}
 
-	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (fd < 0) {
+static int udp_sender_open(struct udp_sender *sender, uint32_t mark,
+			   uint16_t gso_size)
+{
+	struct cmsghdr *cmsg;
+
+	memset(sender, 0, sizeof(*sender));
+	sender->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (sender->fd < 0) {
 		perror("socket UDP");
 		return -1;
 	}
-	if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
+	if (setsockopt(sender->fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
 		perror("setsockopt SO_MARK");
-		close(fd);
+		close(sender->fd);
+		sender->fd = -1;
 		return -1;
 	}
 
-	for (size_t i = 0; i < sizeof(payload); i++)
-		payload[i] = (char)('a' + (i % 26));
-
-	dst.sin_family = AF_INET;
-	dst.sin_port = htons(5555);
-	if (inet_pton(AF_INET, "10.99.0.2", &dst.sin_addr) != 1) {
-		close(fd);
+	sender->dst.sin_family = AF_INET;
+	sender->dst.sin_port = htons(5555);
+	if (inet_pton(AF_INET, "10.99.0.2", &sender->dst.sin_addr) != 1) {
+		close(sender->fd);
+		sender->fd = -1;
 		return -1;
 	}
 
-	iov.iov_base = payload;
-	iov.iov_len = sizeof(payload);
-	msg.msg_name = &dst;
-	msg.msg_namelen = sizeof(dst);
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = control;
-	msg.msg_controllen = sizeof(control);
+	if (gso_size) {
+		sender->control_len = sizeof(sender->control);
+		cmsg = (struct cmsghdr *)sender->control;
+		cmsg->cmsg_level = SOL_UDP;
+		cmsg->cmsg_type = UDP_SEGMENT;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(gso_size));
+		memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
+	}
 
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_UDP;
-	cmsg->cmsg_type = UDP_SEGMENT;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(gso_size));
-	memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
+	return 0;
+}
 
-	ret = sendmsg(fd, &msg, 0);
-	if (ret < 0)
-		perror("sendmsg UDP_SEGMENT");
-	close(fd);
-	return ret < 0 ? -1 : 0;
+static void udp_sender_close(struct udp_sender *sender)
+{
+	if (sender->fd >= 0) {
+		close(sender->fd);
+		sender->fd = -1;
+	}
+}
+
+static int udp_sender_send(struct udp_sender *sender, const void *payload,
+			   size_t payload_len)
+{
+	struct iovec iov = {
+		.iov_base = (void *)payload,
+		.iov_len = payload_len,
+	};
+	struct msghdr msg = {
+		.msg_name = &sender->dst,
+		.msg_namelen = sizeof(sender->dst),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+	int ret;
+
+	if (sender->control_len) {
+		msg.msg_control = sender->control;
+		msg.msg_controllen = sender->control_len;
+	}
+
+	ret = sendmsg(sender->fd, &msg, 0);
+	if (ret < 0) {
+		perror("sendmsg UDP");
+		return -1;
+	}
+	return 0;
+}
+
+static int send_marked_udp_gso(void)
+{
+	struct udp_sender sender = { .fd = -1 };
+	int err;
+
+	init_udp_bench_payloads();
+	if (udp_sender_open(&sender, EXPECTED_MARK, GSO_SIZE))
+		return -1;
+	err = udp_sender_send(&sender, udp_bench_gso_payload,
+			      sizeof(udp_bench_gso_payload));
+	udp_sender_close(&sender);
+	return err;
 }
 
 static int send_udp_datagram(uint32_t mark, size_t payload_len)
 {
-	struct sockaddr_in dst = { 0 };
-	char payload[512];
-	int fd, ret;
+	struct udp_sender sender = { .fd = -1 };
+	int err;
 
-	if (payload_len > sizeof(payload))
+	init_udp_bench_payloads();
+	if (payload_len > sizeof(udp_bench_scalar_payload))
 		return -1;
-
-	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (fd < 0) {
-		perror("socket UDP scalar");
+	if (udp_sender_open(&sender, mark, 0))
 		return -1;
-	}
-	if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
-		perror("setsockopt UDP scalar SO_MARK");
-		close(fd);
-		return -1;
-	}
-
-	memset(payload, 'U', payload_len);
-	dst.sin_family = AF_INET;
-	dst.sin_port = htons(5555);
-	if (inet_pton(AF_INET, "10.99.0.2", &dst.sin_addr) != 1) {
-		close(fd);
-		return -1;
-	}
-	ret = sendto(fd, payload, payload_len, 0,
-		     (struct sockaddr *)&dst, sizeof(dst));
-	if (ret < 0)
-		perror("sendto UDP scalar");
-	close(fd);
-	return ret < 0 ? -1 : 0;
+	err = udp_sender_send(&sender, udp_bench_scalar_payload, payload_len);
+	udp_sender_close(&sender);
+	return err;
 }
 
 static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
@@ -1150,6 +1184,7 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_mpls,
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
+	struct udp_sender gso_sender = { .fd = -1 };
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1169,12 +1204,17 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_mpls,
 			goto out;
 	}
 
+	init_udp_bench_payloads();
+	if (udp_sender_open(&gso_sender, EXPECTED_MARK, GSO_SIZE))
+		goto out;
+
 	start = now_ns();
 	for (int i = 0; i < iterations; i++) {
 		size_t packet_len = 0;
 		uint16_t gso_size = 0;
 
-		if (send_marked_udp_gso())
+		if (udp_sender_send(&gso_sender, udp_bench_gso_payload,
+				    sizeof(udp_bench_gso_payload)))
 			goto out;
 		if (with_mpls) {
 			for (int seg = 0; seg < 3; seg++) {
@@ -1197,6 +1237,7 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_mpls,
 	err = 0;
 
 out:
+	udp_sender_close(&gso_sender);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);
@@ -1365,6 +1406,8 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
 	struct tcp_bench_conn tcp_conn = { .fd = -1 };
+	struct udp_sender scalar_sender = { .fd = -1 };
+	struct udp_sender gso_sender = { .fd = -1 };
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1385,13 +1428,18 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 	}
 	if (start_tcp_bench_conn(tun_fd, with_mpls, &tcp_conn))
 		goto out;
+	init_udp_bench_payloads();
+	if (udp_sender_open(&scalar_sender, SECOND_MARK, 0))
+		goto out;
+	if (udp_sender_open(&gso_sender, EXPECTED_MARK, GSO_SIZE))
+		goto out;
 
 	start = now_ns();
 	for (int i = 0; i < iterations; i++) {
 		size_t packet_len = 0;
 		uint16_t gso_size = 0;
 
-		if (send_udp_datagram(SECOND_MARK, 64))
+		if (udp_sender_send(&scalar_sender, udp_bench_scalar_payload, 64))
 			goto out;
 		if (with_mpls) {
 			if (read_mpls_udp_from_tun(tun_fd, SECOND_MARK,
@@ -1404,7 +1452,8 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 			total_bytes += packet_len;
 		}
 
-		if (send_marked_udp_gso())
+		if (udp_sender_send(&gso_sender, udp_bench_gso_payload,
+				    sizeof(udp_bench_gso_payload)))
 			goto out;
 		if (with_mpls) {
 			for (int seg = 0; seg < 3; seg++) {
@@ -1432,6 +1481,8 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 	err = 0;
 
 out:
+	udp_sender_close(&gso_sender);
+	udp_sender_close(&scalar_sender);
 	close_tcp_bench_conn(&tcp_conn);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);

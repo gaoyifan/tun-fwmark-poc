@@ -70,14 +70,14 @@ with 2000 iterations:
 
 ```text
 C:
-BENCH_UDP_GSO baseline=2.734 Gbit/s fwmark=2.322 Gbit/s drop=15.1% segments=2000/2000
-BENCH_TCP_GSO baseline=14.710 Gbit/s fwmark=7.766 Gbit/s drop=47.2% bursts=2000/2000 segments=2000
-BENCH_MIXED baseline=4.263 Gbit/s fwmark=3.204 Gbit/s drop=24.8% bursts=4000/4000 segments=6000
+BENCH_UDP_GSO baseline=15.636 Gbit/s fwmark=7.613 Gbit/s drop=51.3% segments=2000/2000
+BENCH_TCP_GSO baseline=13.867 Gbit/s fwmark=7.453 Gbit/s drop=46.2% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=11.510 Gbit/s fwmark=6.411 Gbit/s drop=44.3% bursts=4000/4000 segments=6000
 
 Go:
-BENCH_UDP_GSO baseline=13.395 Gbit/s fwmark=6.563 Gbit/s drop=51.0% segments=2000/2000
-BENCH_TCP_GSO baseline=13.237 Gbit/s fwmark=6.502 Gbit/s drop=50.9% bursts=2000/2000 segments=2000
-BENCH_MIXED baseline=9.642 Gbit/s fwmark=5.611 Gbit/s drop=41.8% bursts=4000/4000 segments=6000
+BENCH_UDP_GSO baseline=14.024 Gbit/s fwmark=6.473 Gbit/s drop=53.8% segments=2000/2000
+BENCH_TCP_GSO baseline=13.548 Gbit/s fwmark=6.705 Gbit/s drop=50.5% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=9.965 Gbit/s fwmark=5.456 Gbit/s drop=45.3% bursts=4000/4000 segments=6000
 ```
 
 The Go version uses `github.com/cilium/ebpf`, `github.com/vishvananda/netlink`,
@@ -86,8 +86,10 @@ and `golang.org/x/sys/unix` instead of cgo/libbpf wrappers or shelling out to
 connection per benchmark case and send many data bursts over it; the earlier
 per-burst connection shape mostly measured `tcp_connect_init()`/SYN setup and
 userspace handshake overhead rather than steady-state TCP GSO transmission. The
-Go benchmark hot path also reuses UDP sockets, control messages, payloads, and
-TUN read buffers. The synthetic TCP peer writes one cumulative ACK per burst;
+UDP benchmark hot path reuses UDP sockets, control messages, payloads, and TUN
+read buffers in both implementations. The original C UDP benchmark was much
+slower because it created, configured, filled, and closed a UDP socket for every
+timed send. The synthetic TCP peer writes one cumulative ACK per burst;
 ACKing every scalar MPLS segment made the fwmark TCP side measure userspace ACK
 write overhead in addition to the intended TUN read-path segmentation cost.
 

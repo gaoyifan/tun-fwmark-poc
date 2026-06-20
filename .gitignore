@@ -1,3 +1,5 @@
 *.bpf.o
+scripts/tun_fwmark_poc
+scripts/tun_fwmark_poc_go
 __pycache__/
 *.py[cod]
