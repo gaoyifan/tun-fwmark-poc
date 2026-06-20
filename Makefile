@@ -5,7 +5,7 @@ BPF_SRCS := bpf/tun_fwmark.bpf.c
 BPF_OBJS := $(BPF_SRCS:.c=.o)
 POC := scripts/tun_fwmark_poc
 
-.PHONY: all clean test bench
+.PHONY: all clean test bench bench-prepend
 
 all: $(BPF_OBJS) $(POC)
 
@@ -23,3 +23,6 @@ test: all
 
 bench: all
 	sudo -n ./$(POC) --bench 2000
+
+bench-prepend: all
+	sudo -n ./$(POC) --bench-prepend 20000

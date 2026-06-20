@@ -88,6 +88,8 @@ struct tc_attachment {
 	struct bpf_tc_opts opts;
 };
 
+static int enter_new_netns(void);
+
 static void run_cmd_quiet(const char *cmd)
 {
 	(void)system(cmd);
@@ -374,6 +376,48 @@ static int attach_read_bpf(const char *dev, const char *obj_path,
 	}
 
 	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(egress_prog), egress))
+		goto err_close;
+
+	*obj_out = obj;
+	return 0;
+
+err_close:
+	bpf_object__close(obj);
+	return -1;
+}
+
+static int attach_egress_prog(const char *dev, const char *obj_path,
+			      const char *prog_name, struct bpf_object **obj_out,
+			      struct tc_attachment *egress)
+{
+	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+	struct bpf_program *prog;
+	struct bpf_object *obj;
+	int ifindex, err;
+
+	ifindex = get_ifindex(dev);
+	if (ifindex < 0)
+		return -1;
+	if (create_clsact(ifindex))
+		return -1;
+
+	obj = bpf_object__open_file(obj_path, &open_opts);
+	if (!obj) {
+		fprintf(stderr, "failed to open %s\n", obj_path);
+		return -1;
+	}
+	err = bpf_object__load(obj);
+	if (err) {
+		fprintf(stderr, "failed to load %s: %d\n", obj_path, err);
+		goto err_close;
+	}
+
+	prog = bpf_object__find_program_by_name(obj, prog_name);
+	if (!prog) {
+		fprintf(stderr, "BPF program not found: %s\n", prog_name);
+		goto err_close;
+	}
+	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(prog), egress))
 		goto err_close;
 
 	*obj_out = obj;
@@ -945,6 +989,52 @@ static int send_udp_datagram(uint32_t mark, size_t payload_len)
 	return ret < 0 ? -1 : 0;
 }
 
+static int open_udp_sender(uint32_t mark)
+{
+	struct sockaddr_in dst = { 0 };
+	int fd;
+
+	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		perror("socket UDP bench");
+		return -1;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
+		perror("setsockopt UDP bench SO_MARK");
+		close(fd);
+		return -1;
+	}
+	dst.sin_family = AF_INET;
+	dst.sin_port = htons(5555);
+	if (inet_pton(AF_INET, "10.99.0.2", &dst.sin_addr) != 1 ||
+	    connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		perror("connect UDP bench");
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int send_udp_payload(int fd, size_t payload_len)
+{
+	char payload[512];
+	ssize_t ret;
+
+	if (payload_len > sizeof(payload))
+		return -1;
+	memset(payload, 'P', payload_len);
+	ret = send(fd, payload, payload_len, 0);
+	if (ret != (ssize_t)payload_len) {
+		if (ret < 0)
+			perror("send UDP bench");
+		else
+			fprintf(stderr, "short UDP bench send: %zd/%zu\n", ret,
+				payload_len);
+		return -1;
+	}
+	return 0;
+}
+
 static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 				    struct packet_meta *meta)
 {
@@ -976,6 +1066,43 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 	}
 
 	fprintf(stderr, "UDP scalar packet not read from TUN\n");
+	return -1;
+}
+
+static int read_prepended_udp_from_tun(int tun_fd, uint32_t expected_mark,
+				       size_t *packet_len)
+{
+	uint8_t buf[2048];
+	uint32_t mark_be;
+
+	for (int i = 0; i < 256; i++) {
+		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
+		uint8_t *mark = buf + 4 + sizeof(*hdr);
+		uint8_t *ip = mark + 4;
+		ssize_t n = read(tun_fd, buf, sizeof(buf));
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				usleep(100000);
+				continue;
+			}
+			perror("read prepended UDP from TUN");
+			return -1;
+		}
+		if (n < 4 + (ssize_t)sizeof(*hdr) + 4 + 28)
+			continue;
+		if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE)
+			continue;
+		memcpy(&mark_be, mark, sizeof(mark_be));
+		if (ntohl(mark_be) != expected_mark)
+			continue;
+		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_UDP)
+			continue;
+		*packet_len = (size_t)n;
+		return 0;
+	}
+
+	fprintf(stderr, "prepended UDP packet not read from TUN\n");
 	return -1;
 }
 
@@ -1351,6 +1478,124 @@ static double drop_percent(double baseline, double fwmark)
 	return baseline > 0.0 ? (baseline - fwmark) * 100.0 / baseline : 0.0;
 }
 
+static int run_prepend_correctness(const char *obj_path)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	size_t packet_len = 0;
+	int tun_fd = -1;
+	int err = 1;
+
+	if (enter_new_netns())
+		return 1;
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+	if (attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
+			       &obj, &egress))
+		goto out;
+	if (send_udp_datagram(EXPECTED_MARK, 128))
+		goto out;
+	if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK, &packet_len))
+		goto out;
+	printf("PREPEND_READ_PATH_UDP_SCALAR: mark=0x%08x tun_len=%zu\n",
+	       EXPECTED_MARK, packet_len);
+	err = 0;
+
+out:
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int run_prepend_bench_case(const char *obj_path, bool with_bpf,
+				  int iterations, double *gbps)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	size_t total_bytes = 0;
+	uint64_t start, end;
+	int tun_fd = -1, udp_fd = -1;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+	if (with_bpf && attach_egress_prog(DEV_NAME, obj_path,
+					   "tun_read_path_prepend_mark", &obj,
+					   &egress))
+		goto out;
+	udp_fd = open_udp_sender(EXPECTED_MARK);
+	if (udp_fd < 0)
+		goto out;
+
+	start = now_ns();
+	for (int i = 0; i < iterations; i++) {
+		size_t packet_len = 0;
+
+		if (send_udp_payload(udp_fd, 256))
+			goto out;
+		if (with_bpf) {
+			if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK,
+							&packet_len))
+				goto out;
+			packet_len -= 4;
+		} else if (read_udp_scalar_from_tun(tun_fd, &packet_len, NULL)) {
+			goto out;
+		}
+		total_bytes += packet_len;
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	err = 0;
+
+out:
+	if (udp_fd >= 0)
+		close(udp_fd);
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int run_prepend_bench(const char *obj_path, int iterations)
+{
+	double baseline = 0.0, prepend = 0.0;
+
+	if (run_prepend_correctness(obj_path))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_prepend_bench_case(obj_path, false, iterations, &baseline))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_prepend_bench_case(obj_path, true, iterations, &prepend))
+		return 1;
+
+	printf("BENCH_PREPEND_UDP_SCALAR baseline=%.3f Gbit/s prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
+	       baseline, prepend, drop_percent(baseline, prepend), iterations);
+	return 0;
+}
+
 static int enter_new_netns(void)
 {
 	if (unshare(CLONE_NEWNET) < 0) {
@@ -1444,6 +1689,11 @@ int main(int argc, char **argv)
 		int iterations = argc > 2 ? atoi(argv[2]) : 2000;
 
 		return run_bench(obj_path, iterations);
+	}
+	if (argc > 1 && strcmp(argv[1], "--bench-prepend") == 0) {
+		int iterations = argc > 2 ? atoi(argv[2]) : 20000;
+
+		return run_prepend_bench(obj_path, iterations);
 	}
 	if (argc > 1)
 		obj_path = argv[1];

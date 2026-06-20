@@ -67,6 +67,24 @@ This measures the side-channel cost in the PoC runner, including ringbuf
 polling, userspace validation, and TCP control-packet metadata events. It is
 intended as a regression/stress check, not a tuned maximum-throughput benchmark.
 
+For comparison, the repo also includes a non-GSO-only direct prepend variant:
+
+```sh
+make bench-prepend
+```
+
+That BPF program rejects GSO skbs and prepends a 4-byte big-endian fwmark before
+the IP packet only for scalar packets. On the development host, 20000 UDP scalar
+packets produced:
+
+```text
+PREPEND_READ_PATH_UDP_SCALAR: mark=0x00000042 tun_len=174
+BENCH_PREPEND_UDP_SCALAR baseline=2.185 Gbit/s prepend=2.005 Gbit/s drop=8.2% iterations=20000
+```
+
+So the direct prepend method is correct for non-GSO packets in this PoC, but it
+is intentionally not a GSO-capable read-path design.
+
 ## Files
 
 - `bpf/tun_fwmark.bpf.c`: tc ingress/write-path mark import and tc

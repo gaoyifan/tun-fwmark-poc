@@ -135,4 +135,28 @@ int tun_read_path_mark_event(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+SEC("classifier")
+int tun_read_path_prepend_mark(struct __sk_buff *skb)
+{
+	void *data;
+	void *data_end;
+	__u32 mark = bpf_htonl(skb->mark);
+	int ret;
+
+	if (skb->gso_size)
+		return TC_ACT_SHOT;
+
+	ret = bpf_skb_adjust_room(skb, (int)sizeof(mark), BPF_ADJ_ROOM_MAC,
+				  BPF_F_ADJ_ROOM_NO_CSUM_RESET);
+	if (ret < 0)
+		return TC_ACT_SHOT;
+
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
+	if (data + sizeof(mark) > data_end)
+		return TC_ACT_SHOT;
+	*(__u32 *)data = mark;
+	return TC_ACT_OK;
+}
+
 char _license[] SEC("license") = "GPL";

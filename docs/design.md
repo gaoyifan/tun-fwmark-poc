@@ -118,6 +118,25 @@ GSO or checksum metadata. In local experiments, a prepend-based read-path BPF
 program made TCP throughput collapse because the TCP/GSO hot path stopped
 delivering the data skb to the TUN fd correctly.
 
+For non-GSO packets only, direct prepend is viable. The repository includes a
+separate `tun_read_path_prepend_mark` BPF program that rejects any skb with
+`gso_size != 0`, prepends a 4-byte big-endian fwmark, and lets userspace strip
+that prefix after reading from the TUN fd. This is simpler than the ringbuf side
+channel for scalar packets, but it is deliberately not used for GSO traffic.
+
+Run:
+
+```sh
+make bench-prepend
+```
+
+On the development host, 20000 UDP scalar packets produced:
+
+```text
+PREPEND_READ_PATH_UDP_SCALAR: mark=0x00000042 tun_len=174
+BENCH_PREPEND_UDP_SCALAR baseline=2.185 Gbit/s prepend=2.005 Gbit/s drop=8.2% iterations=20000
+```
+
 ## Why Not Append To The Tail
 
 Tail metadata looks attractive because it does not move the IP header. However,
