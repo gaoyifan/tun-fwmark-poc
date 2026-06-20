@@ -1155,34 +1155,34 @@ type tcpBenchConn struct {
 	withMPLS bool
 }
 
-func newTCPBenchConn(tunFD uintptr, withMPLS bool) (*tcpBenchConn, error) {
+func newTCPBenchConn(tunFD uintptr, withMPLS bool) (tcpBenchConn, error) {
 	tcpFD, err := startMarkedTCPClient()
 	if err != nil {
-		return nil, err
+		return tcpBenchConn{tcpFD: -1}, err
 	}
 	var syn tcpPacket
 	if withMPLS {
 		if _, _, err := readMPLSTCPFromTun(tunFD, expectedMark, &syn, 0x02, false); err != nil {
 			unix.Close(tcpFD)
-			return nil, err
+			return tcpBenchConn{tcpFD: -1}, err
 		}
 	} else if err := readTCPControlFromTun(tunFD, &syn, 0x02); err != nil {
 		unix.Close(tcpFD)
-		return nil, err
+		return tcpBenchConn{tcpFD: -1}, err
 	}
 	if err := writeTCPSynAckToTun(tunFD, &syn, false); err != nil {
 		unix.Close(tcpFD)
-		return nil, err
+		return tcpBenchConn{tcpFD: -1}, err
 	}
 	if err := finishTCPConnect(tcpFD); err != nil {
 		unix.Close(tcpFD)
-		return nil, err
+		return tcpBenchConn{tcpFD: -1}, err
 	}
-	return &tcpBenchConn{tunFD: tunFD, tcpFD: tcpFD, withMPLS: withMPLS}, nil
+	return tcpBenchConn{tunFD: tunFD, tcpFD: tcpFD, withMPLS: withMPLS}, nil
 }
 
 func (c *tcpBenchConn) close() {
-	if c != nil && c.tcpFD >= 0 {
+	if c.tcpFD >= 0 {
 		_ = unix.Close(c.tcpFD)
 		c.tcpFD = -1
 	}
