@@ -1219,15 +1219,6 @@ func (c *tcpBenchConn) sendBurst() (int, error) {
 	return packetLen, nil
 }
 
-func runTCPGSOBurst(fd uintptr, withMPLS bool) (int, error) {
-	conn, err := newTCPBenchConn(fd, withMPLS)
-	if err != nil {
-		return 0, err
-	}
-	defer conn.close()
-	return conn.sendBurst()
-}
-
 func runTCPGSOBenchCase(objPath string, withMPLS bool, iterations int) (float64, uint, uint, error) {
 	deleteLinkQuiet(devName)
 	tun, err := openVnetTun(devName)
