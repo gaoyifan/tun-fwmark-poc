@@ -212,6 +212,29 @@ Risks:
 
 This should be treated as an experiment or fallback, not as the primary design.
 
+### Not Viable: `readv()` Batching
+
+Linux TUN supports `readv()`/`writev()` as scatter/gather I/O, but current
+upstream TUN does not use `readv()` to return multiple packets in one syscall.
+The read path is still:
+
+```text
+tun_chr_read_iter()
+  -> tun_do_read()
+    -> tun_ring_recv()
+      -> ptr_ring_consume()   // one skb
+```
+
+`tun_do_read()` then copies that single skb into the provided `iov_iter`. Multiple
+iovecs can split one packet across buffers, but they do not drain multiple TUN
+packets.
+
+`recvmmsg()` is not a practical replacement either: the userspace TUN fd is a
+character device fd, not a socket fd. Public discussions about reducing TUN
+syscall overhead point to the same gap. There was an RFC patch for an
+`IFF_MULTI_READ` flag that would allow one read to return multiple full packets,
+but that interface is not part of the current upstream TUN ABI.
+
 ### Fallback: Keep MPLS In-Band
 
 The current MPLS in-band path remains useful for functional validation, debugging
