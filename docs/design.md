@@ -170,37 +170,50 @@ to rewrite an existing LSE.
 
 A BPF ringbuffer can export marks out of band, but the old version was removed
 from this PoC because the current MPLS design carries the mark in packet bytes.
-Side-channel metadata remains a future optimization direction, not part of the
-current implementation.
+Because the ringbuffer design adds ordering, overflow, and multi-reader
+complexity, it is not a recommended optimization direction for this PoC.
 
 ## Future Optimization Directions
 
-### Preferred: Side-Channel Metadata
+### Preferred: Dual Read Path
 
-The best non-kernel-patch direction is to avoid modifying read-path packet bytes:
+The most practical non-kernel-patch direction is to keep both read paths:
 
-1. tc egress BPF records `skb->mark` into an ordered side channel;
-2. userspace reads the original TUN packet, preserving IP/TCP/UDP GSO;
-3. userspace matches the side-channel mark to the TUN packet and carries it as
-   packet metadata.
+```text
+fwmark == 0: original IP packet -> TUN fd
+fwmark != 0: route encap MPLS -> tc egress rewrites LSE -> TUN fd
+```
 
-This is closest to what an overlay such as Nylon should eventually want: mark as
-metadata, not as a fake packet header.
+Most traffic usually has `skb->mark == 0`. That traffic does not need mark
+metadata, so it should avoid MPLS entirely and preserve the kernel's normal
+IP/TCP/UDP GSO behavior. Only packets with a non-zero mark need the MPLS
+in-band metadata path and pay the scalar-read cost described above.
+
+A future implementation can install a normal IP route to the TUN device for
+unmarked traffic and separate fwmark-selected policy routes that use
+`ip route ... encap mpls ...` for marked traffic. Userspace can distinguish the
+two cases from the TUN PI protocol:
+
+- `ETH_P_IP` / `ETH_P_IPV6`: treat the mark as zero and parse the original IP
+  packet directly;
+- `ETH_P_MPLS_UC`: read the MPLS LSE as the non-zero mark and then parse the
+  inner IP packet.
 
 Open risks:
 
-- proving ordering between TUN fd reads and BPF events;
-- handling event loss or ring/map overflow;
-- supporting multi-queue TUN and multiple readers;
-- matching packets robustly under GRO/GSO, retransmission, and non-IP traffic.
+- route-rule priority must guarantee that only non-zero marked packets enter the
+  MPLS route;
+- userspace needs a mixed read-path parser instead of assuming every read packet
+  contains a mark header;
+- benchmarks should report zero-mark and non-zero-mark traffic separately,
+  because they exercise different kernel paths.
 
-The recommended next experiment is a single-queue, single-reader side-channel
-prototype for IPv4 TCP/UDP GSO.
-
-### Experimental: Higher TUN MTU
+### Not Recommended: Higher TUN MTU
 
 Increasing TUN MTU can reduce the number of scalar MPLS skbs after software
-segmentation. This may improve the MPLS in-band path without kernel patches.
+segmentation. This can make MPLS benchmark numbers look better, but it does not
+fix the underlying GSO loss and should not be treated as a production
+optimization.
 
 Risks:
 
@@ -208,9 +221,12 @@ Risks:
 - the overlay must segment correctly later, or it may cause fragmentation/PMTU
   failures;
 - benchmarks must dynamically drain scalar segments instead of assuming fixed
-  segment counts.
+  segment counts;
+- the optimization depends on traffic shape and configured MTU rather than
+  removing the syscall amplification.
 
-This should be treated as an experiment or fallback, not as the primary design.
+Higher MTU remains useful as an experiment for quantifying scalar-read overhead,
+but it is not a recommended design direction.
 
 ### Not Viable: `readv()` Batching
 
