@@ -81,9 +81,24 @@ TUN fd queue[N]          -> userspace packet read for TUN queue N
 
 For a single-queue TUN, userspace can treat the ringbuf events as sideband
 headers and pop one read-path event for each TUN packet read. For a multi-queue
-TUN, use `queue_mapping` to maintain one FIFO per TUN queue/fd. The L4 fields in
-the event are still useful as cheap sanity checks and for resynchronization, but
-they do not need to be the primary matching key.
+TUN, use `queue_mapping` to maintain one FIFO per TUN queue/fd.
+
+The robust production shape is still simple:
+
+1. drain global ringbuf events into `metadata_fifo[queue_mapping]`;
+2. for each TUN fd, pop the next metadata event from its queue FIFO and read one
+   packet from that TUN queue;
+3. treat a missing metadata event, an empty FIFO, or a full bounded FIFO as
+   desynchronization for that queue;
+4. use `len`, `gso_size`, L4 protocol, and ports as cheap sanity checks and for
+   resynchronization.
+
+This avoids expensive per-packet locking in the BPF hot path. If a production
+implementation needs explicit loss accounting, add a lightweight per-CPU drop
+counter for ringbuf reservation failures and make the userspace dispatcher check
+it periodically. A strict per-queue sequence number is possible, but doing it
+with a shared BPF counter needs synchronization and was measurably heavier in
+mixed traffic than the FIFO-plus-drop-counter shape.
 
 For a GSO super-packet this is the correct granularity: the whole skb has one
 `skb->mark`, so one metadata event per skb/super-packet is enough. The packet
@@ -113,16 +128,15 @@ The ringbuf side channel is cleaner.
 
 ## Limitations
 
-- Ringbuf metadata is a side channel. Production code should include a robust
-  matching strategy, especially with multi-queue TUN devices.
 - Single-queue users can usually consume ringbuf events and TUN packets in FIFO
   order.
 - Multi-queue users should maintain one metadata FIFO per queue/fd using
   `queue_mapping`.
 - FIFO matching assumes packets are not dropped after the tc egress hook has
   emitted metadata and that ringbuf events are not lost. Production code should
-  count ringbuf drops, size the TUN queue/ringbuf conservatively, and use the L4
-  metadata as a sanity check or resynchronization hint.
+  count ringbuf drops, use bounded metadata FIFOs, size the TUN queue/ringbuf
+  conservatively, and use the L4 metadata as a sanity check or resynchronization
+  hint.
 - Ringbuf overflow means metadata loss. A production implementation needs
   counters and a resynchronization policy.
 - The PoC verifies UDP GSO with `UDP_SEGMENT` and TCP GSO with a minimal TCP

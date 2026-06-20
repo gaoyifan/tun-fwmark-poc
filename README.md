@@ -11,8 +11,9 @@ The PoC uses a PI-mode `IFF_VNET_HDR` TUN device:
   stack.
 - **TUN Read Path**: tc egress BPF does not modify packet bytes. It emits one
   ringbuf metadata event per skb/super-packet containing `skb->mark`, `len`,
-  `gso_size`, and `gso_segs`. Userspace reads the normal TUN packet and consumes
-  the matching metadata event out of band.
+  `gso_size`, `gso_segs`, and `queue_mapping`. Userspace reads the normal TUN
+  packet and consumes the matching metadata event out of band. The intended
+  matching model is FIFO per TUN queue.
 
 This avoids the failed designs:
 
