@@ -41,21 +41,29 @@ READ_PATH_TCP: event mark=0x00000042 ... gso_size=1460 gso_segs=5
 PASS: TUN write path imports fwmark; TUN read path exports fwmark out-of-band while preserving UDP and TCP GSO super-packets
 ```
 
-For a simple read-path UDP GSO baseline comparison:
+For a read-path baseline comparison:
 
 ```sh
 make bench
 ```
 
-On the development host, 10000 UDP GSO super-packets produced:
+The benchmark runs each case in a fresh network namespace:
+
+- UDP GSO super-packets;
+- TCP GSO burst packets from a minimal userspace TCP peer;
+- mixed traffic: UDP scalar, UDP GSO, and TCP GSO per iteration.
+
+On the development host, 5000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.650 Gbit/s fwmark=2.120 Gbit/s drop=20.0% events=10000/10000
+BENCH_UDP_GSO baseline=2.648 Gbit/s fwmark=2.183 Gbit/s drop=17.5% events=5000/5000
+BENCH_TCP_GSO baseline=3.301 Gbit/s fwmark=2.703 Gbit/s drop=18.1% gso_events=5000/5000 total_events=19999
+BENCH_MIXED baseline=2.430 Gbit/s fwmark=1.977 Gbit/s drop=18.6% gso_events=10000/10000 total_events=30445
 ```
 
-This benchmark measures the side-channel cost in the PoC runner, including
-ringbuf polling and userspace validation. It is intended as a regression/stress
-check, not a tuned maximum-throughput benchmark.
+This measures the side-channel cost in the PoC runner, including ringbuf
+polling, userspace validation, and TCP control-packet metadata events. It is
+intended as a regression/stress check, not a tuned maximum-throughput benchmark.
 
 ## Files
 

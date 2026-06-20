@@ -160,17 +160,34 @@ The runner also provides:
 make bench
 ```
 
-This runs two UDP GSO read-path loops in an isolated network namespace:
+This runs baseline and fwmark read-path loops in fresh isolated network
+namespaces:
 
-1. baseline: no fwmark BPF, only send UDP GSO and read the TUN fd;
-2. fwmark: attach read-path ringbuf BPF, send the same UDP GSO workload, read
-   the TUN fd, and consume one metadata event per super-packet.
+1. baseline: no fwmark BPF, send traffic and read the TUN fd;
+2. fwmark: attach only the read-path ringbuf BPF, send the same workload, read
+   the TUN fd, and consume metadata events.
 
-On the development host, 10000 UDP GSO super-packets produced:
+It covers:
+
+- UDP GSO super-packets;
+- TCP GSO burst packets from the minimal TCP peer;
+- mixed traffic with one UDP scalar packet, one UDP GSO super-packet, and one
+  TCP GSO burst per iteration.
+
+On the development host, 5000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.650 Gbit/s fwmark=2.120 Gbit/s drop=20.0% events=10000/10000
+BENCH_UDP_GSO baseline=2.648 Gbit/s fwmark=2.183 Gbit/s drop=17.5% events=5000/5000
+BENCH_TCP_GSO baseline=3.301 Gbit/s fwmark=2.703 Gbit/s drop=18.1% gso_events=5000/5000 total_events=19999
+BENCH_MIXED baseline=2.430 Gbit/s fwmark=1.977 Gbit/s drop=18.6% gso_events=10000/10000 total_events=30445
 ```
 
-The event count is part of the assertion. A mismatch fails the benchmark, which
-catches ringbuf/event loss under this stress workload.
+The GSO event count is part of the assertion. A mismatch fails the benchmark,
+which catches ringbuf/event loss under this stress workload. `total_events`
+includes scalar TCP control packets such as SYN, ACK, and FIN, so it is expected
+to be higher than the GSO data event count for TCP and mixed cases.
+
+These numbers are PoC-runner numbers. They include ringbuf polling, userspace
+event validation, socket setup for short TCP bursts, and the minimal TCP peer's
+ACK path. They are useful for regression and order-of-magnitude overhead checks,
+but they are not a tuned maximum-throughput result.

@@ -32,6 +32,7 @@
 #define EXPECTED_MARK 0x00000042u
 #define SECOND_MARK 0x00000043u
 #define GSO_SIZE 1200
+#define TCP_SERVER_SEQ 0xabc00000u
 #define DIR_WRITE_PATH 1
 #define DIR_READ_PATH 2
 
@@ -56,6 +57,7 @@ struct event_state {
 	bool write_gso_seen;
 	bool scalar_seen;
 	bool zero_seen;
+	unsigned int total_read_events;
 	unsigned int read_events;
 	struct fwmark_event write_event;
 	struct fwmark_event write_gso_event;
@@ -263,6 +265,49 @@ err_close:
 	return -1;
 }
 
+static int attach_read_bpf(const char *dev, const char *obj_path,
+			   struct bpf_object **obj_out,
+			   struct tc_attachment *egress)
+{
+	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+	struct bpf_program *egress_prog;
+	struct bpf_object *obj;
+	int ifindex, err;
+
+	ifindex = get_ifindex(dev);
+	if (ifindex < 0)
+		return -1;
+	if (create_clsact(ifindex))
+		return -1;
+
+	obj = bpf_object__open_file(obj_path, &open_opts);
+	if (!obj) {
+		fprintf(stderr, "failed to open %s\n", obj_path);
+		return -1;
+	}
+	err = bpf_object__load(obj);
+	if (err) {
+		fprintf(stderr, "failed to load %s: %d\n", obj_path, err);
+		goto err_close;
+	}
+
+	egress_prog = bpf_object__find_program_by_name(obj, "tun_read_path_mark_event");
+	if (!egress_prog) {
+		fprintf(stderr, "read-path BPF program not found\n");
+		goto err_close;
+	}
+
+	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(egress_prog), egress))
+		goto err_close;
+
+	*obj_out = obj;
+	return 0;
+
+err_close:
+	bpf_object__close(obj);
+	return -1;
+}
+
 static int handle_event(void *ctx, void *data, size_t len)
 {
 	struct event_state *state = ctx;
@@ -271,6 +316,8 @@ static int handle_event(void *ctx, void *data, size_t len)
 	if (len < sizeof(event))
 		return 0;
 	memcpy(&event, data, sizeof(event));
+	if (event.direction == DIR_READ_PATH)
+		state->total_read_events++;
 
 	if (event.direction == DIR_WRITE_PATH && event.mark == EXPECTED_MARK &&
 	    event.gso_size == 0 && !state->write_seen) {
@@ -348,15 +395,17 @@ static size_t build_ipv4_udp(uint8_t *out, size_t out_len)
 	return total_len;
 }
 
-static int write_marked_vnet_packet_to_tun(int tun_fd, const uint8_t *packet,
-					   size_t packet_len,
-					   const struct virtio_net_hdr *vnet)
+static int write_vnet_packet_to_tun(int tun_fd, const uint8_t *packet,
+				    size_t packet_len,
+				    const struct virtio_net_hdr *vnet,
+				    bool with_mark_prefix)
 {
 	uint8_t frame[4 + sizeof(struct virtio_net_hdr) + 4 + 4096];
 	uint32_t mark_be = htonl(EXPECTED_MARK);
 	size_t at = 0;
+	size_t mark_len = with_mark_prefix ? sizeof(mark_be) : 0;
 
-	if (packet_len + 4 + sizeof(*vnet) + 4 > sizeof(frame))
+	if (packet_len + 4 + sizeof(*vnet) + mark_len > sizeof(frame))
 		return -1;
 
 	memset(frame, 0, sizeof(frame));
@@ -365,16 +414,25 @@ static int write_marked_vnet_packet_to_tun(int tun_fd, const uint8_t *packet,
 	at += 4;
 	memcpy(frame + at, vnet, sizeof(*vnet));
 	at += sizeof(*vnet);
-	memcpy(frame + at, &mark_be, sizeof(mark_be));
-	at += sizeof(mark_be);
+	if (with_mark_prefix) {
+		memcpy(frame + at, &mark_be, sizeof(mark_be));
+		at += sizeof(mark_be);
+	}
 	memcpy(frame + at, packet, packet_len);
 	at += packet_len;
 
 	if (write(tun_fd, frame, at) != (ssize_t)at) {
-		perror("write marked TUN packet");
+		perror("write TUN packet");
 		return -1;
 	}
 	return 0;
+}
+
+static int write_marked_vnet_packet_to_tun(int tun_fd, const uint8_t *packet,
+					   size_t packet_len,
+					   const struct virtio_net_hdr *vnet)
+{
+	return write_vnet_packet_to_tun(tun_fd, packet, packet_len, vnet, true);
 }
 
 static int write_marked_udp_packet_to_tun(int tun_fd)
@@ -468,7 +526,7 @@ static int read_tcp_control_from_tun(int tun_fd, struct tcp_packet *packet,
 {
 	uint8_t buf[4096];
 
-	for (int i = 0; i < 50; i++) {
+	for (int i = 0; i < 256; i++) {
 		ssize_t n = read(tun_fd, buf, sizeof(buf));
 		uint8_t *ip = buf + 4 + sizeof(struct virtio_net_hdr);
 		uint8_t *tcp;
@@ -501,14 +559,15 @@ static int read_tcp_control_from_tun(int tun_fd, struct tcp_packet *packet,
 	return -1;
 }
 
-static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn)
+static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn,
+				   bool with_mark_prefix)
 {
 	uint8_t packet[20 + 24];
 	uint8_t *ip = packet;
 	uint8_t *tcp = packet + 20;
 	struct virtio_net_hdr vnet = { 0 };
 	size_t total_len = sizeof(packet);
-	uint32_t seq = htonl(0xabc00000u);
+	uint32_t seq = htonl(TCP_SERVER_SEQ);
 	uint32_t ack = htonl(syn->seq + 1);
 	uint16_t mss = htons(1460);
 
@@ -536,7 +595,44 @@ static int write_tcp_synack_to_tun(int tun_fd, const struct tcp_packet *syn)
 	memcpy(tcp + 22, &mss, sizeof(mss));
 	*(uint16_t *)(tcp + 16) = htons(tcp_checksum(ip, tcp, 24));
 
-	return write_marked_vnet_packet_to_tun(tun_fd, packet, sizeof(packet), &vnet);
+	return write_vnet_packet_to_tun(tun_fd, packet, sizeof(packet), &vnet,
+					with_mark_prefix);
+}
+
+static int write_tcp_ack_to_tun(int tun_fd, const struct tcp_packet *data,
+				uint32_t payload_len)
+{
+	uint8_t packet[20 + 20];
+	uint8_t *ip = packet;
+	uint8_t *tcp = packet + 20;
+	struct virtio_net_hdr vnet = { 0 };
+	uint32_t seq = htonl(TCP_SERVER_SEQ + 1);
+	uint32_t ack = htonl(data->seq + payload_len);
+	size_t total_len = sizeof(packet);
+
+	memset(packet, 0, sizeof(packet));
+	ip[0] = 0x45;
+	ip[2] = (uint8_t)(total_len >> 8);
+	ip[3] = (uint8_t)total_len;
+	ip[4] = 0x9a;
+	ip[5] = 0xbd;
+	ip[8] = 64;
+	ip[9] = IPPROTO_TCP;
+	memcpy(ip + 12, &data->daddr, sizeof(data->daddr));
+	memcpy(ip + 16, &data->saddr, sizeof(data->saddr));
+	*(uint16_t *)(ip + 10) = htons(csum16(ip, 20));
+
+	*(uint16_t *)(tcp + 0) = htons(data->dport);
+	*(uint16_t *)(tcp + 2) = htons(data->sport);
+	memcpy(tcp + 4, &seq, sizeof(seq));
+	memcpy(tcp + 8, &ack, sizeof(ack));
+	tcp[12] = 5 << 4;
+	tcp[13] = 0x10;
+	*(uint16_t *)(tcp + 14) = htons(65535);
+	*(uint16_t *)(tcp + 16) = htons(tcp_checksum(ip, tcp, 20));
+
+	return write_vnet_packet_to_tun(tun_fd, packet, sizeof(packet), &vnet,
+					false);
 }
 
 static int start_marked_tcp_client(void)
@@ -598,18 +694,49 @@ static int finish_tcp_connect(int fd)
 	return 0;
 }
 
-static int send_tcp_payload(int fd)
+static int send_tcp_payload_len(int fd, size_t payload_len)
 {
 	char payload[1 << 20];
-	ssize_t n;
+	size_t sent = 0;
 
-	memset(payload, 'T', sizeof(payload));
-	n = send(fd, payload, sizeof(payload), MSG_NOSIGNAL);
-	if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-		perror("send TCP payload");
+	if (payload_len > sizeof(payload))
+		return -1;
+
+	memset(payload, 'T', payload_len);
+	for (int i = 0; sent < payload_len && i < 100; i++) {
+		ssize_t n = send(fd, payload + sent, payload_len - sent,
+				 MSG_NOSIGNAL);
+
+		if (n > 0) {
+			sent += (size_t)n;
+			continue;
+		}
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			fd_set wfds;
+			struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+
+			FD_ZERO(&wfds);
+			FD_SET(fd, &wfds);
+			if (select(fd + 1, NULL, &wfds, NULL, &tv) < 0) {
+				perror("select TCP send");
+				return -1;
+			}
+			continue;
+		}
+		if (n < 0)
+			perror("send TCP payload");
+		return -1;
+	}
+	if (sent != payload_len) {
+		fprintf(stderr, "short TCP payload send: %zu/%zu\n", sent, payload_len);
 		return -1;
 	}
 	return 0;
+}
+
+static int send_tcp_payload(int fd)
+{
+	return send_tcp_payload_len(fd, 1460 * 5);
 }
 
 static int send_marked_udp_gso(void)
@@ -706,7 +833,7 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len)
 {
 	uint8_t buf[2048];
 
-	for (int i = 0; i < 50; i++) {
+	for (int i = 0; i < 256; i++) {
 		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
 		uint8_t *ip = buf + 4 + sizeof(*hdr);
 		ssize_t n = read(tun_fd, buf, sizeof(buf));
@@ -740,7 +867,7 @@ static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
 	uint8_t last_gso_type = 0;
 	uint16_t last_gso_size = 0;
 
-	for (int i = 0; i < 50; i++) {
+	for (int i = 0; i < 256; i++) {
 		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
 		ssize_t n = read(tun_fd, buf, sizeof(buf));
 
@@ -768,6 +895,66 @@ static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
 	return -1;
 }
 
+static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
+				      uint16_t *gso_size,
+				      struct tcp_packet *packet,
+				      uint32_t *payload_len)
+{
+	uint8_t buf[8192];
+	uint8_t last_gso_type = 0;
+	uint16_t last_gso_size = 0;
+
+	for (int i = 0; i < 256; i++) {
+		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
+		uint8_t *ip = buf + 4 + sizeof(*hdr);
+		uint8_t *tcp;
+		uint16_t total_len;
+		uint8_t ihl, thl;
+		ssize_t n = read(tun_fd, buf, sizeof(buf));
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				usleep(100000);
+				continue;
+			}
+			perror("read TCP GSO from TUN");
+			return -1;
+		}
+		if (n < 4 + (ssize_t)sizeof(*hdr) + 40)
+			continue;
+		last_gso_type = hdr->gso_type;
+		last_gso_size = hdr->gso_size;
+		if (hdr->gso_type != VIRTIO_NET_HDR_GSO_TCPV4)
+			continue;
+		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_TCP)
+			continue;
+
+		ihl = (ip[0] & 0x0f) * 4;
+		if (ihl < 20 || n < 4 + (ssize_t)sizeof(*hdr) + ihl + 20)
+			continue;
+		tcp = ip + ihl;
+		thl = (tcp[12] >> 4) * 4;
+		total_len = ((uint16_t)ip[2] << 8) | ip[3];
+		if (thl < 20 || total_len < ihl + thl)
+			continue;
+
+		memcpy(&packet->saddr, ip + 12, sizeof(packet->saddr));
+		memcpy(&packet->daddr, ip + 16, sizeof(packet->daddr));
+		packet->sport = ((uint16_t)tcp[0] << 8) | tcp[1];
+		packet->dport = ((uint16_t)tcp[2] << 8) | tcp[3];
+		packet->seq = ntohl(*(uint32_t *)(tcp + 4));
+		packet->flags = tcp[13];
+		*payload_len = total_len - ihl - thl;
+		*packet_len = (size_t)n;
+		*gso_size = hdr->gso_size;
+		return 0;
+	}
+
+	fprintf(stderr, "expected TCP GSO packet not read from TUN; last gso_type=%u gso_size=%u\n",
+		last_gso_type, last_gso_size);
+	return -1;
+}
+
 static uint64_t now_ns(void)
 {
 	struct timespec ts;
@@ -780,7 +967,7 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 				  int iterations, double *gbps,
 				  unsigned int *events)
 {
-	struct tc_attachment ingress = { 0 }, egress = { 0 };
+	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
 	struct ring_buffer *rb = NULL;
 	struct event_state state = { 0 };
@@ -798,7 +985,7 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 		goto out;
 
 	if (with_bpf) {
-		if (attach_bpf(DEV_NAME, obj_path, &obj, &ingress, &egress))
+		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
 			goto out;
 		map = bpf_object__find_map_by_name(obj, "fwmark_events");
 		if (!map)
@@ -832,9 +1019,7 @@ out:
 	if (rb)
 		ring_buffer__free(rb);
 	if (obj) {
-		bpf_tc_detach(&ingress.hook, &ingress.opts);
 		bpf_tc_detach(&egress.hook, &egress.opts);
-		bpf_tc_hook_destroy(&ingress.hook);
 		bpf_tc_hook_destroy(&egress.hook);
 		bpf_object__close(obj);
 	}
@@ -844,31 +1029,264 @@ out:
 	return err;
 }
 
-static int run_bench(const char *obj_path, int iterations)
+static int run_tcp_gso_burst(int tun_fd, struct ring_buffer *rb,
+			     struct event_state *state,
+			     unsigned int expected_gso_events,
+			     size_t *packet_len)
 {
-	double baseline_gbps = 0.0;
-	double fwmark_gbps = 0.0;
-	unsigned int baseline_events = 0;
-	unsigned int fwmark_events = 0;
+	struct tcp_packet syn = { 0 };
+	struct tcp_packet data = { 0 };
+	uint32_t payload_len = 0;
+	uint16_t gso_size = 0;
+	int tcp_fd = -1;
+	int err = -1;
 
+	tcp_fd = start_marked_tcp_client();
+	if (tcp_fd < 0)
+		goto out;
+	if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
+		goto out;
+	if (write_tcp_synack_to_tun(tun_fd, &syn, false))
+		goto out;
+	if (finish_tcp_connect(tcp_fd))
+		goto out;
+	if (send_tcp_payload_len(tcp_fd, 1460 * 5))
+		goto out;
+	if (rb && poll_until_read_events(rb, state, expected_gso_events))
+		goto out;
+	if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size, &data,
+				       &payload_len))
+		goto out;
+	if (!gso_size) {
+		fprintf(stderr, "unexpected TCP benchmark GSO size: %u\n", gso_size);
+		goto out;
+	}
+	if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
+		goto out;
+
+	err = 0;
+
+out:
+	if (tcp_fd >= 0)
+		close(tcp_fd);
+	return err;
+}
+
+static int run_tcp_gso_bench_case(const char *obj_path, bool with_bpf,
+				  int iterations, double *gbps,
+				  unsigned int *gso_events,
+				  unsigned int *total_events)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	struct ring_buffer *rb = NULL;
+	struct event_state state = { 0 };
+	struct bpf_map *map;
+	size_t total_bytes = 0;
+	uint64_t start, end;
+	int tun_fd = -1;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+
+	if (with_bpf) {
+		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
+			goto out;
+		map = bpf_object__find_map_by_name(obj, "fwmark_events");
+		if (!map)
+			goto out;
+		rb = ring_buffer__new(bpf_map__fd(map), handle_event, &state, NULL);
+		if (!rb)
+			goto out;
+	}
+
+	start = now_ns();
+	for (int i = 0; i < iterations; i++) {
+		size_t packet_len = 0;
+
+		if (run_tcp_gso_burst(tun_fd, rb, &state, i + 1, &packet_len))
+			goto out;
+		total_bytes += packet_len;
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	*gso_events = state.read_events;
+	*total_events = state.total_read_events;
+	err = 0;
+
+out:
+	if (rb)
+		ring_buffer__free(rb);
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
+				int iterations, double *gbps,
+				unsigned int *gso_events,
+				unsigned int *total_events)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	struct ring_buffer *rb = NULL;
+	struct event_state state = { 0 };
+	struct bpf_map *map;
+	size_t total_bytes = 0;
+	uint64_t start, end;
+	int tun_fd = -1;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+
+	if (with_bpf) {
+		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
+			goto out;
+		map = bpf_object__find_map_by_name(obj, "fwmark_events");
+		if (!map)
+			goto out;
+		rb = ring_buffer__new(bpf_map__fd(map), handle_event, &state, NULL);
+		if (!rb)
+			goto out;
+	}
+
+	start = now_ns();
+	for (int i = 0; i < iterations; i++) {
+		size_t packet_len = 0;
+		uint16_t gso_size = 0;
+
+		if (send_udp_datagram(SECOND_MARK, 64))
+			goto out;
+		if (rb)
+			ring_buffer__poll(rb, 0);
+		if (read_udp_scalar_from_tun(tun_fd, &packet_len))
+			goto out;
+		total_bytes += packet_len;
+
+		if (send_marked_udp_gso())
+			goto out;
+		if (rb && poll_until_read_events(rb, &state, (i * 2) + 1))
+			goto out;
+		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
+				      &packet_len, &gso_size))
+			goto out;
+		total_bytes += packet_len;
+
+		if (run_tcp_gso_burst(tun_fd, rb, &state, (i * 2) + 2,
+				      &packet_len))
+			goto out;
+		total_bytes += packet_len;
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	*gso_events = state.read_events;
+	*total_events = state.total_read_events;
+	err = 0;
+
+out:
+	if (rb)
+		ring_buffer__free(rb);
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static double drop_percent(double baseline, double fwmark)
+{
+	return baseline > 0.0 ? (baseline - fwmark) * 100.0 / baseline : 0.0;
+}
+
+static int enter_new_netns(void)
+{
 	if (unshare(CLONE_NEWNET) < 0) {
 		perror("unshare CLONE_NEWNET");
-		return 1;
+		return -1;
 	}
 	run_cmd_quiet("ip link set lo up >/dev/null 2>&1");
+	return 0;
+}
 
-	if (run_udp_gso_bench_case(obj_path, false, iterations, &baseline_gbps,
+static int run_bench(const char *obj_path, int iterations)
+{
+	double base_udp = 0.0, fwmark_udp = 0.0;
+	double base_tcp = 0.0, fwmark_tcp = 0.0;
+	double base_mixed = 0.0, fwmark_mixed = 0.0;
+	unsigned int baseline_events = 0, fwmark_events = 0;
+	unsigned int baseline_total = 0, fwmark_total = 0;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_udp_gso_bench_case(obj_path, false, iterations, &base_udp,
 				   &baseline_events))
 		return 1;
-	if (run_udp_gso_bench_case(obj_path, true, iterations, &fwmark_gbps,
+	if (enter_new_netns())
+		return 1;
+	if (run_udp_gso_bench_case(obj_path, true, iterations, &fwmark_udp,
 				   &fwmark_events))
 		return 1;
 
 	printf("BENCH_UDP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% events=%u/%d\n",
-	       baseline_gbps, fwmark_gbps,
-	       baseline_gbps > 0.0 ? (baseline_gbps - fwmark_gbps) * 100.0 / baseline_gbps : 0.0,
+	       base_udp, fwmark_udp, drop_percent(base_udp, fwmark_udp),
 	       fwmark_events, iterations);
 	if (fwmark_events != (unsigned int)iterations)
+		return 1;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_gso_bench_case(obj_path, false, iterations, &base_tcp,
+				   &baseline_events, &baseline_total))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_gso_bench_case(obj_path, true, iterations, &fwmark_tcp,
+				   &fwmark_events, &fwmark_total))
+		return 1;
+
+	printf("BENCH_TCP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% gso_events=%u/%d total_events=%u\n",
+	       base_tcp, fwmark_tcp, drop_percent(base_tcp, fwmark_tcp),
+	       fwmark_events, iterations, fwmark_total);
+	if (fwmark_events != (unsigned int)iterations)
+		return 1;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_mixed_bench_case(obj_path, false, iterations, &base_mixed,
+				 &baseline_events, &baseline_total))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_mixed_bench_case(obj_path, true, iterations, &fwmark_mixed,
+				 &fwmark_events, &fwmark_total))
+		return 1;
+
+	printf("BENCH_MIXED baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% gso_events=%u/%d total_events=%u\n",
+	       base_mixed, fwmark_mixed, drop_percent(base_mixed, fwmark_mixed),
+	       fwmark_events, iterations * 2, fwmark_total);
+	if (fwmark_events != (unsigned int)iterations * 2)
 		return 1;
 	return 0;
 }
@@ -976,7 +1394,7 @@ int main(int argc, char **argv)
 		goto out;
 	if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
 		goto out;
-	if (write_tcp_synack_to_tun(tun_fd, &syn))
+	if (write_tcp_synack_to_tun(tun_fd, &syn, true))
 		goto out;
 	if (finish_tcp_connect(tcp_fd))
 		goto out;
