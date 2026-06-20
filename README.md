@@ -26,6 +26,11 @@ make test
 ```
 
 The test requires `sudo -n` for TUN, tc BPF, MPLS configuration, and `SO_MARK`.
+There is also a Go implementation of the same PoC:
+
+```sh
+make test-go
+```
 
 Expected output:
 
@@ -43,6 +48,7 @@ For a route-encap read-path baseline comparison:
 
 ```sh
 make bench
+make bench-go
 ```
 
 The benchmark runs each case in a fresh network namespace:
@@ -59,6 +65,27 @@ BENCH_TCP_GSO baseline=3.377 Gbit/s fwmark=2.022 Gbit/s drop=40.1% bursts=2000/2
 BENCH_MIXED baseline=2.470 Gbit/s fwmark=1.826 Gbit/s drop=26.1% bursts=4000/4000 segments=6000
 ```
 
+After adding the Go implementation, the same host produced this C/Go comparison
+with 2000 iterations:
+
+```text
+C:
+BENCH_UDP_GSO baseline=2.631 Gbit/s fwmark=2.263 Gbit/s drop=14.0% segments=2000/2000
+BENCH_TCP_GSO baseline=3.330 Gbit/s fwmark=2.046 Gbit/s drop=38.6% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=2.470 Gbit/s fwmark=1.796 Gbit/s drop=27.3% bursts=4000/4000 segments=6000
+
+Go:
+BENCH_UDP_GSO baseline=13.594 Gbit/s fwmark=6.441 Gbit/s drop=52.6% segments=2000/2000
+BENCH_TCP_GSO baseline=2.859 Gbit/s fwmark=1.760 Gbit/s drop=38.4% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=3.589 Gbit/s fwmark=2.103 Gbit/s drop=41.4% bursts=4000/4000 segments=6000
+```
+
+The Go version uses `github.com/cilium/ebpf`, `github.com/vishvananda/netlink`,
+and `golang.org/x/sys/unix` instead of cgo/libbpf wrappers or shelling out to
+`ip`/`tc` for steady-state setup. The benchmark hot path reuses UDP sockets,
+control messages, payloads, and TUN read buffers. TCP still creates a fresh
+client connection per burst to preserve the same test shape as the C PoC.
+
 On this TUN device, MPLS packets are software-segmented before userspace reads
 them because TUN does not advertise MPLS TSO/USO features through
 `dev->mpls_features`. The fwmark result is therefore a scalar MPLS read-path
@@ -71,6 +98,8 @@ super-packets.
   egress/read-path MPLS LSE rewrite.
 - `scripts/tun_fwmark_poc.c`: creates a temporary PI+VNET TUN, attaches the BPF
   programs, sends test traffic, reads TUN packets, and verifies fwmark handling.
+- `scripts/tun_fwmark_poc.go`: Go implementation of the same functional and
+  benchmark flow, using pure Go eBPF/netlink/unix libraries.
 - `docs/design.md`: technical design notes, rejected alternatives, and
   limitations.
 
