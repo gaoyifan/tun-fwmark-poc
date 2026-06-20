@@ -95,6 +95,18 @@ As a result:
 This is still useful for measuring the practical cost of this PoC shape, but it
 does not prove MPLS preserves TUN GSO super-packets.
 
+## Benchmark Method
+
+The TCP benchmark uses one TCP connection per benchmark case and sends many data
+bursts over that connection. This keeps the measured loop focused on
+`tcp_write_xmit()` and TUN read-path behavior.
+
+An earlier shape created a fresh TCP socket and completed a synthetic handshake
+for every burst. That mostly measured connection setup work in
+`tcp_connect_init()`, SYN transmission, and userspace handshake emulation. It
+also made TCP look much slower than UDP, whose benchmark already reused a socket
+and sent steady-state UDP GSO datagrams.
+
 ## Rejected Alternatives
 
 ### Direct eBPF Prepend On Read Path

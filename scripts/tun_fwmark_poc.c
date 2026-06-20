@@ -1208,36 +1208,64 @@ out:
 	return err;
 }
 
-static int run_tcp_gso_burst(int tun_fd, bool with_mpls, size_t *packet_len)
+struct tcp_bench_conn {
+	int fd;
+	bool with_mpls;
+};
+
+static void close_tcp_bench_conn(struct tcp_bench_conn *conn)
+{
+	if (conn->fd >= 0) {
+		close(conn->fd);
+		conn->fd = -1;
+	}
+}
+
+static int start_tcp_bench_conn(int tun_fd, bool with_mpls,
+				struct tcp_bench_conn *conn)
 {
 	struct tcp_packet syn = { 0 };
-	struct tcp_packet data = { 0 };
 	uint32_t payload_len = 0;
-	uint16_t gso_size = 0;
-	int tcp_fd = -1;
-	int err = -1;
+	int tcp_fd;
 
+	conn->fd = -1;
+	conn->with_mpls = with_mpls;
 	tcp_fd = start_marked_tcp_client();
 	if (tcp_fd < 0)
-		goto out;
+		return -1;
 	if (with_mpls) {
 		size_t syn_packet_len = 0;
 
 		if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK, &syn,
 					   &payload_len, &syn_packet_len, 0x02,
 					   false))
-			goto out;
+			goto err_close;
 	} else {
 		if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
-			goto out;
+			goto err_close;
 	}
 	if (write_tcp_synack_to_tun(tun_fd, &syn, false))
-		goto out;
+		goto err_close;
 	if (finish_tcp_connect(tcp_fd))
-		goto out;
-	if (send_tcp_payload_len(tcp_fd, 1460 * 5))
-		goto out;
-	if (with_mpls) {
+		goto err_close;
+	conn->fd = tcp_fd;
+	return 0;
+
+err_close:
+	close(tcp_fd);
+	return -1;
+}
+
+static int run_tcp_bench_conn_burst(int tun_fd, struct tcp_bench_conn *conn,
+				    size_t *packet_len)
+{
+	struct tcp_packet data = { 0 };
+	uint32_t payload_len = 0;
+	uint16_t gso_size = 0;
+
+	if (send_tcp_payload_len(conn->fd, 1460 * 5))
+		return -1;
+	if (conn->with_mpls) {
 		size_t received_payload = 0;
 		size_t total_packet_len = 0;
 
@@ -1247,9 +1275,9 @@ static int run_tcp_gso_burst(int tun_fd, bool with_mpls, size_t *packet_len)
 			if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK,
 						   &data, &payload_len,
 						   &one_packet_len, 0x10, true))
-				goto out;
+				return -1;
 			if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
-				goto out;
+				return -1;
 			received_payload += payload_len;
 			total_packet_len += one_packet_len - 4;
 		}
@@ -1257,21 +1285,15 @@ static int run_tcp_gso_burst(int tun_fd, bool with_mpls, size_t *packet_len)
 	} else {
 		if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size,
 					       &data, &payload_len, NULL))
-			goto out;
+			return -1;
 		if (!gso_size) {
 			fprintf(stderr, "unexpected TCP benchmark GSO size: %u\n", gso_size);
-			goto out;
+			return -1;
 		}
 		if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
-			goto out;
+			return -1;
 	}
-
-	err = 0;
-
-out:
-	if (tcp_fd >= 0)
-		close(tcp_fd);
-	return err;
+	return 0;
 }
 
 static int run_tcp_gso_bench_case(const char *obj_path, bool with_mpls,
@@ -1281,6 +1303,7 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_mpls,
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
+	struct tcp_bench_conn tcp_conn = { .fd = -1 };
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1299,12 +1322,14 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_mpls,
 		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
 			goto out;
 	}
+	if (start_tcp_bench_conn(tun_fd, with_mpls, &tcp_conn))
+		goto out;
 
 	start = now_ns();
 	for (int i = 0; i < iterations; i++) {
 		size_t packet_len = 0;
 
-		if (run_tcp_gso_burst(tun_fd, with_mpls, &packet_len))
+		if (run_tcp_bench_conn_burst(tun_fd, &tcp_conn, &packet_len))
 			goto out;
 		total_bytes += packet_len;
 	}
@@ -1316,6 +1341,7 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_mpls,
 	err = 0;
 
 out:
+	close_tcp_bench_conn(&tcp_conn);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);
@@ -1334,6 +1360,7 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
+	struct tcp_bench_conn tcp_conn = { .fd = -1 };
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1352,6 +1379,8 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
 			goto out;
 	}
+	if (start_tcp_bench_conn(tun_fd, with_mpls, &tcp_conn))
+		goto out;
 
 	start = now_ns();
 	for (int i = 0; i < iterations; i++) {
@@ -1387,7 +1416,7 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 			total_bytes += packet_len;
 		}
 
-		if (run_tcp_gso_burst(tun_fd, with_mpls, &packet_len))
+		if (run_tcp_bench_conn_burst(tun_fd, &tcp_conn, &packet_len))
 			goto out;
 		total_bytes += packet_len;
 	}
@@ -1399,6 +1428,7 @@ static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 	err = 0;
 
 out:
+	close_tcp_bench_conn(&tcp_conn);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);

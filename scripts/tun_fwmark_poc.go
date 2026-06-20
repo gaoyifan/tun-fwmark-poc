@@ -999,7 +999,7 @@ func sendTCPPayloadLen(fd int, payloadLen int) error {
 	}
 	sent := 0
 	for i := 0; sent < payloadLen && i < 100; i++ {
-		n, err := unix.SendmsgN(fd, payload[sent:], nil, nil, unix.MSG_NOSIGNAL)
+		n, err := unix.Write(fd, payload[sent:])
 		if n > 0 {
 			sent += n
 			continue
@@ -1144,39 +1144,59 @@ func runUDPGSOBenchCase(objPath string, withMPLS bool, iterations int) (float64,
 	return float64(totalBytes) * 8.0 / float64(elapsed), uint(map[bool]int{true: iterations, false: 0}[withMPLS]), nil
 }
 
-func runTCPGSOBurst(fd uintptr, withMPLS bool) (int, error) {
+type tcpBenchConn struct {
+	tunFD    uintptr
+	tcpFD    int
+	withMPLS bool
+}
+
+func newTCPBenchConn(tunFD uintptr, withMPLS bool) (*tcpBenchConn, error) {
 	tcpFD, err := startMarkedTCPClient()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	defer unix.Close(tcpFD)
 	var syn tcpPacket
 	if withMPLS {
-		if _, _, err := readMPLSTCPFromTun(fd, expectedMark, &syn, 0x02, false); err != nil {
-			return 0, err
+		if _, _, err := readMPLSTCPFromTun(tunFD, expectedMark, &syn, 0x02, false); err != nil {
+			unix.Close(tcpFD)
+			return nil, err
 		}
-	} else if err := readTCPControlFromTun(fd, &syn, 0x02); err != nil {
-		return 0, err
+	} else if err := readTCPControlFromTun(tunFD, &syn, 0x02); err != nil {
+		unix.Close(tcpFD)
+		return nil, err
 	}
-	if err := writeTCPSynAckToTun(fd, &syn, false); err != nil {
-		return 0, err
+	if err := writeTCPSynAckToTun(tunFD, &syn, false); err != nil {
+		unix.Close(tcpFD)
+		return nil, err
 	}
 	if err := finishTCPConnect(tcpFD); err != nil {
+		unix.Close(tcpFD)
+		return nil, err
+	}
+	return &tcpBenchConn{tunFD: tunFD, tcpFD: tcpFD, withMPLS: withMPLS}, nil
+}
+
+func (c *tcpBenchConn) close() {
+	if c != nil && c.tcpFD >= 0 {
+		_ = unix.Close(c.tcpFD)
+		c.tcpFD = -1
+	}
+}
+
+func (c *tcpBenchConn) sendBurst() (int, error) {
+	if err := sendTCPPayloadLen(c.tcpFD, 1460*5); err != nil {
 		return 0, err
 	}
-	if err := sendTCPPayloadLen(tcpFD, 1460*5); err != nil {
-		return 0, err
-	}
-	if withMPLS {
+	if c.withMPLS {
 		receivedPayload := uint32(0)
 		totalLen := 0
 		for receivedPayload < 1460*5 {
 			var data tcpPacket
-			payloadLen, oneLen, err := readMPLSTCPFromTun(fd, expectedMark, &data, 0x10, true)
+			payloadLen, oneLen, err := readMPLSTCPFromTun(c.tunFD, expectedMark, &data, 0x10, true)
 			if err != nil {
 				return 0, err
 			}
-			if err := writeTCPAckToTun(fd, &data, payloadLen); err != nil {
+			if err := writeTCPAckToTun(c.tunFD, &data, payloadLen); err != nil {
 				return 0, err
 			}
 			receivedPayload += payloadLen
@@ -1186,17 +1206,26 @@ func runTCPGSOBurst(fd uintptr, withMPLS bool) (int, error) {
 	}
 	var data tcpPacket
 	var payloadLen uint32
-	packetLen, gsoSize, err := readTCPGSODataFromTun(fd, &data, &payloadLen, nil)
+	packetLen, gsoSize, err := readTCPGSODataFromTun(c.tunFD, &data, &payloadLen, nil)
 	if err != nil {
 		return 0, err
 	}
 	if gsoSize == 0 {
 		return 0, errors.New("unexpected TCP benchmark GSO size: 0")
 	}
-	if err := writeTCPAckToTun(fd, &data, payloadLen); err != nil {
+	if err := writeTCPAckToTun(c.tunFD, &data, payloadLen); err != nil {
 		return 0, err
 	}
 	return packetLen, nil
+}
+
+func runTCPGSOBurst(fd uintptr, withMPLS bool) (int, error) {
+	conn, err := newTCPBenchConn(fd, withMPLS)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.close()
+	return conn.sendBurst()
 }
 
 func runTCPGSOBenchCase(objPath string, withMPLS bool, iterations int) (float64, uint, uint, error) {
@@ -1222,10 +1251,16 @@ func runTCPGSOBenchCase(objPath string, withMPLS bool, iterations int) (float64,
 		}
 		defer attach.close()
 	}
+	tcpConn, err := newTCPBenchConn(tun.Fd(), withMPLS)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer tcpConn.close()
+
 	totalBytes := 0
 	start := time.Now()
 	for i := 0; i < iterations; i++ {
-		n, err := runTCPGSOBurst(tun.Fd(), withMPLS)
+		n, err := tcpConn.sendBurst()
 		if err != nil {
 			return 0, 0, 0, err
 		}
@@ -1272,6 +1307,11 @@ func runMixedBenchCase(objPath string, withMPLS bool, iterations int) (float64, 
 		return 0, 0, 0, err
 	}
 	defer gsoSender.close()
+	tcpConn, err := newTCPBenchConn(tun.Fd(), withMPLS)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer tcpConn.close()
 
 	totalBytes := 0
 	start := time.Now()
@@ -1310,7 +1350,7 @@ func runMixedBenchCase(objPath string, withMPLS bool, iterations int) (float64, 
 			}
 			totalBytes += n
 		}
-		n, err := runTCPGSOBurst(tun.Fd(), withMPLS)
+		n, err := tcpConn.sendBurst()
 		if err != nil {
 			return 0, 0, 0, err
 		}
