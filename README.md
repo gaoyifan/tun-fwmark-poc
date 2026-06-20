@@ -85,6 +85,26 @@ BENCH_PREPEND_UDP_SCALAR baseline=2.185 Gbit/s prepend=2.005 Gbit/s drop=8.2% it
 So the direct prepend method is correct for non-GSO packets in this PoC, but it
 is intentionally not a GSO-capable read-path design.
 
+To compare “GSO baseline without fwmark” against “GSO disabled plus direct
+prepend fwmark”:
+
+```sh
+make bench-nogso-prepend-udp
+make bench-nogso-prepend-tcp
+```
+
+On the development host:
+
+```text
+BENCH_NOGSO_PREPEND_UDP baseline_gso=4.351 Gbit/s nogso_prepend=7.292 Gbit/s drop=-67.6% iterations=5000
+BENCH_NOGSO_PREPEND_TCP baseline_gso=0.468 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=467.58 nogso_mbps=0.04 iterations=10
+```
+
+The UDP result is specific to this local microbenchmark: no-GSO sends three
+ordinary UDP datagrams, while the GSO baseline uses `UDP_SEGMENT` cmsg. The TCP
+result shows the riskier case: once TUN GSO is removed, the scalar prepend path
+collapses in this userspace TCP-peer benchmark.
+
 ## Files
 
 - `bpf/tun_fwmark.bpf.c`: tc ingress/write-path mark import and tc

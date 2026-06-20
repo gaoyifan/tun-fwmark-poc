@@ -137,6 +137,33 @@ PREPEND_READ_PATH_UDP_SCALAR: mark=0x00000042 tun_len=174
 BENCH_PREPEND_UDP_SCALAR baseline=2.185 Gbit/s prepend=2.005 Gbit/s drop=8.2% iterations=20000
 ```
 
+The runner also has a stricter comparison against a GSO-enabled no-fwmark
+baseline:
+
+```sh
+make bench-nogso-prepend-udp
+make bench-nogso-prepend-tcp
+```
+
+The comparison is:
+
+1. baseline: TUN offloads enabled, no fwmark BPF;
+2. no-GSO prepend: TUN offloads disabled, tc egress prepends 4-byte fwmark to
+   scalar packets.
+
+On the development host:
+
+```text
+BENCH_NOGSO_PREPEND_UDP baseline_gso=4.351 Gbit/s nogso_prepend=7.292 Gbit/s drop=-67.6% iterations=5000
+BENCH_NOGSO_PREPEND_TCP baseline_gso=0.468 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=467.58 nogso_mbps=0.04 iterations=10
+```
+
+The UDP number is a local microbenchmark result, not a general claim that
+disabling GSO is faster. In this runner, the GSO side uses `UDP_SEGMENT` cmsg,
+while the no-GSO side sends ordinary UDP datagrams. TCP is the more important
+warning: with TUN offloads disabled, the prepend path degrades to about
+0.04 Mbit/s in this userspace TCP-peer benchmark.
+
 ## Why Not Append To The Tail
 
 Tail metadata looks attractive because it does not move the IP header. However,

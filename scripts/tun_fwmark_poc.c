@@ -12,6 +12,7 @@
 #include <linux/virtio_net.h>
 #include <netinet/in.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -181,7 +183,7 @@ static bool event_matches_packet(const struct fwmark_event *event,
 	       event->l4_cookie == meta->l4_cookie;
 }
 
-static int open_vnet_tun(const char *name)
+static int open_vnet_tun_with_offloads(const char *name, bool enable_offloads)
 {
 	struct ifreq ifr = { 0 };
 	int fd, offloads, vnet_hdr_len;
@@ -207,6 +209,9 @@ static int open_vnet_tun(const char *name)
 		return -1;
 	}
 
+	if (!enable_offloads)
+		return fd;
+
 	offloads = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6;
 	if (ioctl(fd, TUNSETOFFLOAD, offloads) < 0) {
 		offloads = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
@@ -218,6 +223,16 @@ static int open_vnet_tun(const char *name)
 	}
 
 	return fd;
+}
+
+static int open_vnet_tun(const char *name)
+{
+	return open_vnet_tun_with_offloads(name, true);
+}
+
+static int open_vnet_tun_no_offloads(const char *name)
+{
+	return open_vnet_tun_with_offloads(name, false);
 }
 
 static int configure_tun(const char *name, const char *addr)
@@ -693,7 +708,7 @@ static int read_tcp_control_from_tun(int tun_fd, struct tcp_packet *packet,
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(100000);
+				usleep(1000);
 				continue;
 			}
 			perror("read TCP control from TUN");
@@ -1017,7 +1032,7 @@ static int open_udp_sender(uint32_t mark)
 
 static int send_udp_payload(int fd, size_t payload_len)
 {
-	char payload[512];
+	char payload[1600];
 	ssize_t ret;
 
 	if (payload_len > sizeof(payload))
@@ -1035,6 +1050,44 @@ static int send_udp_payload(int fd, size_t payload_len)
 	return 0;
 }
 
+static int send_udp_gso_payload(int fd)
+{
+	char payload[GSO_SIZE * 3] = { 0 };
+	char control[CMSG_SPACE(sizeof(uint16_t))] = { 0 };
+	struct msghdr msg = { 0 };
+	struct cmsghdr *cmsg;
+	struct iovec iov;
+	uint16_t gso_size = GSO_SIZE;
+	ssize_t ret;
+
+	for (size_t i = 0; i < sizeof(payload); i++)
+		payload[i] = (char)('a' + (i % 26));
+
+	iov.iov_base = payload;
+	iov.iov_len = sizeof(payload);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = control;
+	msg.msg_controllen = sizeof(control);
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_UDP;
+	cmsg->cmsg_type = UDP_SEGMENT;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(gso_size));
+	memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
+
+	ret = sendmsg(fd, &msg, 0);
+	if (ret != (ssize_t)sizeof(payload)) {
+		if (ret < 0)
+			perror("sendmsg UDP bench GSO");
+		else
+			fprintf(stderr, "short UDP bench GSO send: %zd/%zu\n",
+				ret, sizeof(payload));
+		return -1;
+	}
+	return 0;
+}
+
 static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 				    struct packet_meta *meta)
 {
@@ -1047,7 +1100,7 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(100000);
+				usleep(1000);
 				continue;
 			}
 			perror("read UDP scalar from TUN");
@@ -1083,7 +1136,7 @@ static int read_prepended_udp_from_tun(int tun_fd, uint32_t expected_mark,
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(100000);
+				usleep(1000);
 				continue;
 			}
 			perror("read prepended UDP from TUN");
@@ -1106,11 +1159,80 @@ static int read_prepended_udp_from_tun(int tun_fd, uint32_t expected_mark,
 	return -1;
 }
 
+static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
+				       struct tcp_packet *packet,
+				       uint32_t *payload_len,
+				       size_t *packet_len,
+				       uint8_t required_flags,
+				       bool require_payload)
+{
+	uint8_t buf[4096];
+	uint8_t last_gso_type = 0;
+	uint32_t mark_be;
+
+	for (int i = 0; i < 512; i++) {
+		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
+		uint8_t *mark = buf + 4 + sizeof(*hdr);
+		uint8_t *ip = mark + 4;
+		uint8_t *tcp;
+		uint16_t total_len;
+		uint8_t ihl, thl;
+		uint32_t plen;
+		ssize_t n = read(tun_fd, buf, sizeof(buf));
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				usleep(100000);
+				continue;
+			}
+			perror("read prepended TCP from TUN");
+			return -1;
+		}
+		if (n < 4 + (ssize_t)sizeof(*hdr) + 4 + 40)
+			continue;
+		last_gso_type = hdr->gso_type;
+		if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE)
+			continue;
+		memcpy(&mark_be, mark, sizeof(mark_be));
+		if (ntohl(mark_be) != expected_mark)
+			continue;
+		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_TCP)
+			continue;
+		ihl = (ip[0] & 0x0f) * 4;
+		if (ihl < 20 || n < 4 + (ssize_t)sizeof(*hdr) + 4 + ihl + 20)
+			continue;
+		tcp = ip + ihl;
+		thl = (tcp[12] >> 4) * 4;
+		total_len = ((uint16_t)ip[2] << 8) | ip[3];
+		if (thl < 20 || total_len < ihl + thl)
+			continue;
+		plen = total_len - ihl - thl;
+		if ((tcp[13] & required_flags) != required_flags)
+			continue;
+		if (require_payload && !plen)
+			continue;
+
+		memcpy(&packet->saddr, ip + 12, sizeof(packet->saddr));
+		memcpy(&packet->daddr, ip + 16, sizeof(packet->daddr));
+		packet->sport = ((uint16_t)tcp[0] << 8) | tcp[1];
+		packet->dport = ((uint16_t)tcp[2] << 8) | tcp[3];
+		packet->seq = ntohl(*(uint32_t *)(tcp + 4));
+		packet->flags = tcp[13];
+		*payload_len = plen;
+		*packet_len = (size_t)n;
+		return 0;
+	}
+
+	fprintf(stderr, "prepended TCP packet not read from TUN; last gso_type=%u\n",
+		last_gso_type);
+	return -1;
+}
+
 static int read_gso_from_tun(int tun_fd, uint8_t expected_gso_type,
 			     size_t *packet_len, uint16_t *gso_size,
 			     struct packet_meta *meta)
 {
-	uint8_t buf[8192];
+	uint8_t buf[131072];
 	uint8_t last_gso_type = 0;
 	uint16_t last_gso_size = 0;
 
@@ -1150,7 +1272,7 @@ static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
 				      uint32_t *payload_len,
 				      struct packet_meta *meta)
 {
-	uint8_t buf[8192];
+	uint8_t buf[131072];
 	uint8_t last_gso_type = 0;
 	uint16_t last_gso_size = 0;
 
@@ -1204,6 +1326,61 @@ static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
 
 	fprintf(stderr, "expected TCP GSO packet not read from TUN; last gso_type=%u gso_size=%u\n",
 		last_gso_type, last_gso_size);
+	return -1;
+}
+
+static int read_tcp_data_from_tun(int tun_fd, size_t *packet_len,
+				  struct tcp_packet *packet,
+				  uint32_t *payload_len)
+{
+	uint8_t buf[131072];
+
+	for (int i = 0; i < 512; i++) {
+		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
+		uint8_t *ip = buf + 4 + sizeof(*hdr);
+		uint8_t *tcp;
+		uint16_t total_len;
+		uint8_t ihl, thl;
+		uint32_t plen;
+		ssize_t n = read(tun_fd, buf, sizeof(buf));
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				usleep(1000);
+				continue;
+			}
+			perror("read TCP data from TUN");
+			return -1;
+		}
+		if (n < 4 + (ssize_t)sizeof(*hdr) + 40)
+			continue;
+		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_TCP)
+			continue;
+		ihl = (ip[0] & 0x0f) * 4;
+		if (ihl < 20 || n < 4 + (ssize_t)sizeof(*hdr) + ihl + 20)
+			continue;
+		tcp = ip + ihl;
+		thl = (tcp[12] >> 4) * 4;
+		total_len = ((uint16_t)ip[2] << 8) | ip[3];
+		if (thl < 20 || total_len < ihl + thl)
+			continue;
+		plen = total_len - ihl - thl;
+		if (!plen)
+			continue;
+
+		memcpy(&packet->saddr, ip + 12, sizeof(packet->saddr));
+		memcpy(&packet->daddr, ip + 16, sizeof(packet->daddr));
+		packet->sport = ((uint16_t)tcp[0] << 8) | tcp[1];
+		packet->dport = ((uint16_t)tcp[2] << 8) | tcp[3];
+		packet->seq = ntohl(*(uint32_t *)(tcp + 4));
+		packet->flags = tcp[13];
+		*payload_len = plen;
+		*packet_len = (size_t)n;
+		(void)hdr;
+		return 0;
+	}
+
+	fprintf(stderr, "TCP data packet not read from TUN\n");
 	return -1;
 }
 
@@ -1596,6 +1773,314 @@ static int run_prepend_bench(const char *obj_path, int iterations)
 	return 0;
 }
 
+static int run_nogso_prepend_udp_case(const char *obj_path, int iterations,
+				      double *gbps)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	size_t total_bytes = 0;
+	uint64_t start, end;
+	int tun_fd = -1, udp_fd = -1;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun_no_offloads(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+	if (attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
+			       &obj, &egress))
+		goto out;
+	udp_fd = open_udp_sender(EXPECTED_MARK);
+	if (udp_fd < 0)
+		goto out;
+
+	start = now_ns();
+	for (int i = 0; i < iterations; i++) {
+		for (int seg = 0; seg < 3; seg++) {
+			size_t packet_len = 0;
+
+			if (send_udp_payload(udp_fd, GSO_SIZE))
+				goto out;
+			if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK,
+							&packet_len))
+				goto out;
+			total_bytes += packet_len - 4;
+		}
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	err = 0;
+
+out:
+	if (udp_fd >= 0)
+		close(udp_fd);
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int run_gso_udp_persistent_baseline_case(int iterations, double *gbps)
+{
+	size_t total_bytes = 0;
+	uint64_t start, end;
+	int tun_fd = -1, udp_fd = -1;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+	udp_fd = open_udp_sender(EXPECTED_MARK);
+	if (udp_fd < 0)
+		goto out;
+
+	start = now_ns();
+	for (int i = 0; i < iterations; i++) {
+		size_t packet_len = 0;
+		uint16_t gso_size = 0;
+
+		if (send_udp_gso_payload(udp_fd))
+			goto out;
+		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
+				      &packet_len, &gso_size, NULL))
+			goto out;
+		total_bytes += packet_len;
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	err = 0;
+
+out:
+	if (udp_fd >= 0)
+		close(udp_fd);
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int send_tcp_payload_blocking(int fd, size_t payload_len)
+{
+	char payload[16384];
+	size_t sent = 0;
+	int flags;
+
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags >= 0)
+		fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+	memset(payload, 'S', sizeof(payload));
+
+	while (sent < payload_len) {
+		size_t chunk = payload_len - sent;
+		ssize_t n;
+
+		if (chunk > sizeof(payload))
+			chunk = sizeof(payload);
+		n = send(fd, payload, chunk, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("send TCP stream payload");
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+static int run_tcp_stream_bench_case(const char *obj_path, bool nogso_prepend,
+				     int iterations, double *gbps)
+{
+	struct tc_attachment egress = { 0 };
+	struct bpf_object *obj = NULL;
+	struct tcp_packet syn = { 0 };
+	size_t total_bytes = 0;
+	size_t target_payload = (size_t)iterations * 1460 * 5;
+	size_t received_payload = 0;
+	uint64_t start, end;
+	int tun_fd = -1, tcp_fd = -1;
+	pid_t child = -1;
+	int status = 0;
+	int err = -1;
+
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	tun_fd = nogso_prepend ? open_vnet_tun_no_offloads(DEV_NAME) :
+				 open_vnet_tun(DEV_NAME);
+	if (tun_fd < 0)
+		goto out;
+	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
+		goto out;
+	if (nogso_prepend &&
+	    attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
+			       &obj, &egress))
+		goto out;
+
+	tcp_fd = start_marked_tcp_client();
+	if (tcp_fd < 0)
+		goto out;
+	if (nogso_prepend) {
+		uint32_t payload_len = 0;
+		size_t packet_len = 0;
+
+		if (read_prepended_tcp_from_tun(tun_fd, EXPECTED_MARK, &syn,
+						&payload_len, &packet_len, 0x02,
+						false))
+			goto out;
+	} else if (read_tcp_control_from_tun(tun_fd, &syn, 0x02)) {
+		goto out;
+	}
+	if (write_tcp_synack_to_tun(tun_fd, &syn, false))
+		goto out;
+	if (finish_tcp_connect(tcp_fd))
+		goto out;
+
+	start = now_ns();
+	child = fork();
+	if (child < 0) {
+		perror("fork TCP sender");
+		goto out;
+	}
+	if (child == 0) {
+		int rc = send_tcp_payload_blocking(tcp_fd, target_payload);
+
+		_exit(rc ? 1 : 0);
+	}
+
+	while (received_payload < target_payload) {
+		struct tcp_packet data = { 0 };
+		uint32_t payload_len = 0;
+		size_t packet_len = 0;
+
+		if (nogso_prepend) {
+			if (read_prepended_tcp_from_tun(tun_fd, EXPECTED_MARK,
+							&data, &payload_len,
+							&packet_len, 0x10, true))
+				goto out;
+			packet_len -= 4;
+		} else {
+			if (read_tcp_data_from_tun(tun_fd, &packet_len, &data,
+						   &payload_len))
+				goto out;
+		}
+		if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
+			goto out;
+		received_payload += payload_len;
+		total_bytes += packet_len;
+	}
+
+	if (waitpid(child, &status, 0) < 0) {
+		perror("waitpid TCP sender");
+		goto out;
+	}
+	child = -1;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "TCP sender child failed\n");
+		goto out;
+	}
+	end = now_ns();
+
+	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
+	err = 0;
+
+out:
+	if (child > 0) {
+		kill(child, SIGKILL);
+		waitpid(child, NULL, 0);
+	}
+	if (tcp_fd >= 0)
+		close(tcp_fd);
+	if (obj) {
+		bpf_tc_detach(&egress.hook, &egress.opts);
+		bpf_tc_hook_destroy(&egress.hook);
+		bpf_object__close(obj);
+	}
+	if (tun_fd >= 0)
+		close(tun_fd);
+	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
+	return err;
+}
+
+static int run_nogso_prepend_bench(const char *obj_path, int iterations)
+{
+	double base_udp = 0.0, nogso_udp = 0.0;
+	double base_tcp = 0.0, nogso_tcp = 0.0;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_gso_udp_persistent_baseline_case(iterations, &base_udp))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_nogso_prepend_udp_case(obj_path, iterations, &nogso_udp))
+		return 1;
+
+	printf("BENCH_NOGSO_PREPEND_UDP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
+	       base_udp, nogso_udp, drop_percent(base_udp, nogso_udp), iterations);
+
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_stream_bench_case(obj_path, false, iterations, &base_tcp))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
+		return 1;
+
+	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f iterations=%d\n",
+	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
+	       base_tcp * 1000.0, nogso_tcp * 1000.0, iterations);
+	return 0;
+}
+
+static int run_nogso_prepend_udp_bench(const char *obj_path, int iterations)
+{
+	double base_udp = 0.0, nogso_udp = 0.0;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_gso_udp_persistent_baseline_case(iterations, &base_udp))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_nogso_prepend_udp_case(obj_path, iterations, &nogso_udp))
+		return 1;
+	printf("BENCH_NOGSO_PREPEND_UDP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
+	       base_udp, nogso_udp, drop_percent(base_udp, nogso_udp), iterations);
+	return 0;
+}
+
+static int run_nogso_prepend_tcp_bench(const char *obj_path, int iterations)
+{
+	double base_tcp = 0.0, nogso_tcp = 0.0;
+
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_stream_bench_case(obj_path, false, iterations, &base_tcp))
+		return 1;
+	if (enter_new_netns())
+		return 1;
+	if (run_tcp_stream_bench_case(obj_path, true, iterations, &nogso_tcp))
+		return 1;
+	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f iterations=%d\n",
+	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
+	       base_tcp * 1000.0, nogso_tcp * 1000.0, iterations);
+	return 0;
+}
+
 static int enter_new_netns(void)
 {
 	if (unshare(CLONE_NEWNET) < 0) {
@@ -1694,6 +2179,21 @@ int main(int argc, char **argv)
 		int iterations = argc > 2 ? atoi(argv[2]) : 20000;
 
 		return run_prepend_bench(obj_path, iterations);
+	}
+	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend") == 0) {
+		int iterations = argc > 2 ? atoi(argv[2]) : 10;
+
+		return run_nogso_prepend_bench(obj_path, iterations);
+	}
+	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend-udp") == 0) {
+		int iterations = argc > 2 ? atoi(argv[2]) : 5000;
+
+		return run_nogso_prepend_udp_bench(obj_path, iterations);
+	}
+	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend-tcp") == 0) {
+		int iterations = argc > 2 ? atoi(argv[2]) : 10;
+
+		return run_nogso_prepend_tcp_bench(obj_path, iterations);
 	}
 	if (argc > 1)
 		obj_path = argv[1];
