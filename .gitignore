@@ -1,0 +1,3 @@
+*.bpf.o
+__pycache__/
+*.py[cod]
