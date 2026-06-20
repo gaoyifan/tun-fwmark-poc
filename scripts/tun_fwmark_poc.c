@@ -1188,7 +1188,7 @@ static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(100000);
+				usleep(1000);
 				continue;
 			}
 			perror("read prepended TCP from TUN");

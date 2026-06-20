@@ -154,8 +154,8 @@ The comparison is:
 On the development host:
 
 ```text
-BENCH_NOGSO_PREPEND_UDP baseline_gso=4.325 Gbit/s nogso_prepend=7.362 Gbit/s drop=-70.2% iterations=5000
-BENCH_NOGSO_PREPEND_TCP baseline_gso=3.361 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=3361.01 nogso_mbps=0.04 baseline_iterations=2000 nogso_iterations=10
+BENCH_NOGSO_PREPEND_UDP baseline_gso=2.527 Gbit/s nogso_prepend=6.850 Gbit/s drop=-171.1% iterations=5000
+BENCH_NOGSO_PREPEND_TCP baseline_gso=1.286 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=1285.68 nogso_mbps=0.06 baseline_iterations=2000 nogso_iterations=10
 ```
 
 The UDP number is a local microbenchmark result, not a general claim that
@@ -164,12 +164,15 @@ while the no-GSO side sends ordinary UDP datagrams. TCP is the more important
 warning: disabling TUN offloads alone is not what caused the pathological
 result. A diagnostic no-GSO/plain TCP stream reaches about 0.476 Gbit/s for the
 same small stream shape, while no-GSO plus tc egress prepend drops to about
-0.04 Mbit/s. The differentiator is `bpf_skb_adjust_room()` on TCP scalar skbs:
-the PoC observes roughly one TCP segment every 300 ms after prepend. This is
-consistent with the helper's skb head-growth slow path interacting badly with
-TCP skb ownership/TSQ pacing. The TCP command uses a larger GSO baseline
-iteration count than the no-GSO side because the prepend path is orders of
-magnitude slower.
+0.06 Mbit/s. The differentiator is `bpf_skb_adjust_room()` on TCP scalar skbs.
+The original 300 ms observation included a 100 ms PoC polling delay; after
+reducing that delay, ftrace/kprobe shows the remaining roughly 200 ms interval
+comes from `ICSK_TIME_PROBE0`: `tcp_write_timer_handler()` calls
+`tcp_write_wakeup(LINUX_MIB_TCPWINPROBE)` and releases about one segment per
+timer. TCP_INFO during the run shows ACKs are accepted, `snd_wnd` remains open,
+and bytes remain in `notsent_bytes`, so this is not a checksum-drop problem.
+The TCP command uses a larger GSO baseline iteration count than the no-GSO side
+because the prepend path is orders of magnitude slower.
 
 ## Why Not Append To The Tail
 
