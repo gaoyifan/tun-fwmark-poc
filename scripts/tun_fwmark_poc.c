@@ -35,27 +35,14 @@
 #define SECOND_MARK 0x00000043u
 #define GSO_SIZE 1200
 #define TCP_SERVER_SEQ 0xabc00000u
-#define DIR_WRITE_PATH 1
-#define DIR_READ_PATH 2
 
-struct fwmark_event {
-	uint64_t tstamp_ns;
-	uint32_t direction;
-	uint32_t ifindex;
-	uint32_t queue_mapping;
-	uint32_t ip_saddr;
-	uint32_t ip_daddr;
-	uint32_t ip_id;
+struct fwmark_sample {
+	uint32_t seen;
 	uint32_t mark;
 	uint32_t len;
-	uint32_t hash;
 	uint32_t gso_size;
 	uint32_t gso_segs;
-	uint32_t protocol;
 	uint32_t ip_proto;
-	uint32_t sport;
-	uint32_t dport;
-	uint32_t l4_cookie;
 };
 
 struct packet_meta {
@@ -70,19 +57,9 @@ struct packet_meta {
 	uint32_t l4_cookie;
 };
 
-struct event_state {
-	bool write_seen;
-	bool write_gso_seen;
-	bool scalar_seen;
-	bool zero_seen;
-	unsigned int total_read_events;
-	unsigned int read_events;
-	struct fwmark_event write_event;
-	struct fwmark_event write_gso_event;
-	struct fwmark_event scalar_event;
-	struct fwmark_event zero_event;
-	struct fwmark_event udp_read_event;
-	struct fwmark_event tcp_read_event;
+struct mpls_packet_meta {
+	uint32_t mark;
+	struct packet_meta packet;
 };
 
 struct tc_attachment {
@@ -123,28 +100,29 @@ static uint16_t csum16(const void *data, size_t len)
 	return (uint16_t)~sum;
 }
 
-static int parse_tun_packet_meta(const uint8_t *buf, ssize_t len,
-				 struct packet_meta *meta)
+static int parse_tun_packet_meta_at(const uint8_t *buf, ssize_t len,
+				    size_t ip_offset, size_t vnet_offset,
+				    struct packet_meta *meta)
 {
-	const struct virtio_net_hdr *hdr = (const struct virtio_net_hdr *)(buf + 4);
-	const uint8_t *ip = buf + 4 + sizeof(*hdr);
+	const struct virtio_net_hdr *hdr = (const struct virtio_net_hdr *)(buf + vnet_offset);
+	const uint8_t *ip = buf + ip_offset;
 	const uint8_t *l4;
 	uint8_t ihl;
 
 	if (!meta)
 		return 0;
 	memset(meta, 0, sizeof(*meta));
-	if (len < 4 + (ssize_t)sizeof(*hdr) + 20)
+	if (len < (ssize_t)ip_offset + 20)
 		return -1;
 	if ((ip[0] >> 4) != 4)
 		return -1;
 
 	ihl = (ip[0] & 0x0f) * 4;
-	if (ihl < 20 || len < 4 + (ssize_t)sizeof(*hdr) + ihl)
+	if (ihl < 20 || len < (ssize_t)ip_offset + ihl)
 		return -1;
 	l4 = ip + ihl;
 
-	meta->len = (uint32_t)(len - 4 - sizeof(*hdr));
+	meta->len = (uint32_t)(len - ip_offset);
 	meta->gso_size = hdr->gso_size;
 	meta->ip_proto = ip[9];
 	meta->ip_id = ((uint16_t)ip[4] << 8) | ip[5];
@@ -152,35 +130,45 @@ static int parse_tun_packet_meta(const uint8_t *buf, ssize_t len,
 	memcpy(&meta->ip_daddr, ip + 16, sizeof(meta->ip_daddr));
 
 	if ((meta->ip_proto == IPPROTO_TCP || meta->ip_proto == IPPROTO_UDP) &&
-	    len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 4) {
+	    len >= (ssize_t)ip_offset + ihl + 4) {
 		meta->sport = ((uint16_t)l4[0] << 8) | l4[1];
 		meta->dport = ((uint16_t)l4[2] << 8) | l4[3];
 		if (meta->ip_proto == IPPROTO_TCP &&
-		    len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 8) {
+		    len >= (ssize_t)ip_offset + ihl + 8) {
 			uint32_t seq;
 
 			memcpy(&seq, l4 + 4, sizeof(seq));
 			meta->l4_cookie = ntohl(seq);
 		} else if (meta->ip_proto == IPPROTO_UDP &&
-			 len >= 4 + (ssize_t)sizeof(*hdr) + ihl + 6)
+			 len >= (ssize_t)ip_offset + ihl + 6)
 			meta->l4_cookie = ((uint16_t)l4[4] << 8) | l4[5];
 	}
 
 	return 0;
 }
 
-static bool event_matches_packet(const struct fwmark_event *event,
-				 const struct packet_meta *meta)
+static int parse_tun_packet_meta(const uint8_t *buf, ssize_t len,
+				 struct packet_meta *meta)
 {
-	return event->len == meta->len &&
-	       event->gso_size == meta->gso_size &&
-	       event->ip_proto == meta->ip_proto &&
-	       event->sport == meta->sport &&
-	       event->dport == meta->dport &&
-	       event->ip_saddr == meta->ip_saddr &&
-	       event->ip_daddr == meta->ip_daddr &&
-	       event->ip_id == meta->ip_id &&
-	       event->l4_cookie == meta->l4_cookie;
+	return parse_tun_packet_meta_at(buf, len, 4 + sizeof(struct virtio_net_hdr),
+					4, meta);
+}
+
+static int parse_mpls_tun_packet_meta(const uint8_t *buf, ssize_t len,
+				      struct mpls_packet_meta *meta)
+{
+	uint32_t mark_be;
+
+	if (!meta)
+		return 0;
+	memset(meta, 0, sizeof(*meta));
+	if (len < 4 + (ssize_t)sizeof(struct virtio_net_hdr) + 4 + 20)
+		return -1;
+	memcpy(&mark_be, buf + 4 + sizeof(struct virtio_net_hdr), sizeof(mark_be));
+	meta->mark = ntohl(mark_be);
+	return parse_tun_packet_meta_at(buf, len,
+					4 + sizeof(struct virtio_net_hdr) + 4,
+					4, &meta->packet);
 }
 
 static int open_vnet_tun_with_offloads(const char *name, bool enable_offloads)
@@ -230,11 +218,6 @@ static int open_vnet_tun(const char *name)
 	return open_vnet_tun_with_offloads(name, true);
 }
 
-static int open_vnet_tun_no_offloads(const char *name)
-{
-	return open_vnet_tun_with_offloads(name, false);
-}
-
 static int configure_tun(const char *name, const char *addr)
 {
 	char cmd[256];
@@ -246,6 +229,18 @@ static int configure_tun(const char *name, const char *addr)
 	if (run_cmd(cmd))
 		return -1;
 	return 0;
+}
+
+static int configure_mpls_encap_route(const char *name)
+{
+	char cmd[256];
+
+	run_cmd_quiet("modprobe mpls_router >/dev/null 2>&1");
+	run_cmd_quiet("modprobe mpls_iptunnel >/dev/null 2>&1");
+	run_cmd_quiet("sysctl -q -w net.mpls.platform_labels=1048575 >/dev/null 2>&1");
+	snprintf(cmd, sizeof(cmd),
+		 "ip route replace 10.99.0.2/32 encap mpls 16 dev %s", name);
+	return run_cmd(cmd);
 }
 
 static int get_ifindex(const char *dev)
@@ -336,7 +331,7 @@ static int attach_bpf(const char *dev, const char *obj_path,
 	}
 
 	ingress_prog = bpf_object__find_program_by_name(obj, "tun_write_path_mark_strip");
-	egress_prog = bpf_object__find_program_by_name(obj, "tun_read_path_mark_event");
+	egress_prog = bpf_object__find_program_by_name(obj, "tun_read_path_mpls_mark");
 	if (!ingress_prog || !egress_prog) {
 		fprintf(stderr, "BPF programs not found\n");
 		goto err_close;
@@ -384,13 +379,14 @@ static int attach_read_bpf(const char *dev, const char *obj_path,
 		goto err_close;
 	}
 
-	egress_prog = bpf_object__find_program_by_name(obj, "tun_read_path_mark_event");
+	egress_prog = bpf_object__find_program_by_name(obj, "tun_read_path_mpls_mark");
 	if (!egress_prog) {
 		fprintf(stderr, "read-path BPF program not found\n");
 		goto err_close;
 	}
 
-	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(egress_prog), egress))
+	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(egress_prog),
+			  egress))
 		goto err_close;
 
 	*obj_out = obj;
@@ -401,143 +397,33 @@ err_close:
 	return -1;
 }
 
-static int attach_egress_prog(const char *dev, const char *obj_path,
-			      const char *prog_name, struct bpf_object **obj_out,
-			      struct tc_attachment *egress)
+static int read_fwmark_sample(struct bpf_object *obj, uint32_t key,
+			      struct fwmark_sample *sample)
 {
-	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
-	struct bpf_program *prog;
-	struct bpf_object *obj;
-	int ifindex, err;
+	struct bpf_map *map = bpf_object__find_map_by_name(obj, "fwmark_samples");
 
-	ifindex = get_ifindex(dev);
-	if (ifindex < 0)
-		return -1;
-	if (create_clsact(ifindex))
-		return -1;
-
-	obj = bpf_object__open_file(obj_path, &open_opts);
-	if (!obj) {
-		fprintf(stderr, "failed to open %s\n", obj_path);
+	if (!map) {
+		fprintf(stderr, "fwmark sample map not found\n");
 		return -1;
 	}
-	err = bpf_object__load(obj);
-	if (err) {
-		fprintf(stderr, "failed to load %s: %d\n", obj_path, err);
-		goto err_close;
+	if (bpf_map_lookup_elem(bpf_map__fd(map), &key, sample) < 0) {
+		perror("read fwmark sample");
+		return -1;
 	}
-
-	prog = bpf_object__find_program_by_name(obj, prog_name);
-	if (!prog) {
-		fprintf(stderr, "BPF program not found: %s\n", prog_name);
-		goto err_close;
-	}
-	if (attach_one_tc(ifindex, BPF_TC_EGRESS, bpf_program__fd(prog), egress))
-		goto err_close;
-
-	*obj_out = obj;
 	return 0;
+}
 
-err_close:
-	bpf_object__close(obj);
+static int poll_fwmark_sample(struct bpf_object *obj, uint32_t key,
+			      struct fwmark_sample *sample)
+{
+	for (int i = 0; i < 200; i++) {
+		if (read_fwmark_sample(obj, key, sample))
+			return -1;
+		if (sample->seen)
+			return 0;
+		usleep(1000);
+	}
 	return -1;
-}
-
-static uint64_t read_drop_count(struct bpf_object *obj)
-{
-	struct bpf_map *map = bpf_object__find_map_by_name(obj, "fwmark_event_drops");
-	unsigned int nr_cpus;
-	uint64_t *values;
-	uint64_t total = 0;
-	uint32_t key = 0;
-
-	if (!map)
-		return UINT64_MAX;
-	nr_cpus = libbpf_num_possible_cpus();
-	values = calloc(nr_cpus, sizeof(*values));
-	if (!values)
-		return UINT64_MAX;
-	if (bpf_map_lookup_elem(bpf_map__fd(map), &key, values) < 0) {
-		free(values);
-		return UINT64_MAX;
-	}
-	for (unsigned int i = 0; i < nr_cpus; i++)
-		total += values[i];
-	free(values);
-	return total;
-}
-
-static int assert_no_drops(struct bpf_object *obj)
-{
-	uint64_t drops = read_drop_count(obj);
-
-	if (drops == UINT64_MAX) {
-		fprintf(stderr, "failed to read ringbuf drop counter\n");
-		return -1;
-	}
-	if (drops) {
-		fprintf(stderr, "ringbuf metadata drops: %llu\n",
-			(unsigned long long)drops);
-		return -1;
-	}
-	return 0;
-}
-
-static int handle_event(void *ctx, void *data, size_t len)
-{
-	struct event_state *state = ctx;
-	struct fwmark_event event;
-
-	if (len < sizeof(event))
-		return 0;
-	memcpy(&event, data, sizeof(event));
-	if (event.direction == DIR_READ_PATH)
-		state->total_read_events++;
-
-	if (event.direction == DIR_WRITE_PATH && event.mark == EXPECTED_MARK &&
-	    event.gso_size == 0 && !state->write_seen) {
-		state->write_seen = true;
-		state->write_event = event;
-	} else if (event.direction == DIR_WRITE_PATH &&
-		   event.mark == EXPECTED_MARK && event.gso_size == GSO_SIZE &&
-		   event.ip_proto == IPPROTO_UDP && !state->write_gso_seen) {
-		state->write_gso_seen = true;
-		state->write_gso_event = event;
-	} else if (event.direction == DIR_READ_PATH && event.mark == SECOND_MARK &&
-		   event.gso_size == 0 && event.ip_proto == IPPROTO_UDP &&
-		   event.dport == 5555 && !state->scalar_seen) {
-		state->scalar_seen = true;
-		state->scalar_event = event;
-	} else if (event.direction == DIR_READ_PATH && event.mark == 0 &&
-		   event.gso_size == 0 && event.ip_proto == IPPROTO_UDP &&
-		   event.dport == 5555 && !state->zero_seen) {
-		state->zero_seen = true;
-		state->zero_event = event;
-	} else if (event.direction == DIR_READ_PATH && event.mark == EXPECTED_MARK &&
-		   event.gso_size > 0 && (event.ip_proto == IPPROTO_UDP ||
-					  event.ip_proto == IPPROTO_TCP)) {
-		if (state->read_events == 0)
-			state->udp_read_event = event;
-		else if (state->read_events == 1)
-			state->tcp_read_event = event;
-		state->read_events++;
-	}
-	return 0;
-}
-
-static int poll_until(struct ring_buffer *rb, bool *flag)
-{
-	for (int i = 0; i < 20 && !*flag; i++)
-		ring_buffer__poll(rb, 100);
-	return *flag ? 0 : -1;
-}
-
-static int poll_until_read_events(struct ring_buffer *rb, struct event_state *state,
-				  unsigned int target)
-{
-	for (int i = 0; i < 20 && state->read_events < target; i++)
-		ring_buffer__poll(rb, 100);
-	return state->read_events >= target ? 0 : -1;
 }
 
 static size_t build_ipv4_udp(uint8_t *out, size_t out_len)
@@ -1010,90 +896,6 @@ static int send_udp_datagram(uint32_t mark, size_t payload_len)
 	return ret < 0 ? -1 : 0;
 }
 
-static int open_udp_sender(uint32_t mark)
-{
-	struct sockaddr_in dst = { 0 };
-	int fd;
-
-	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (fd < 0) {
-		perror("socket UDP bench");
-		return -1;
-	}
-	if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
-		perror("setsockopt UDP bench SO_MARK");
-		close(fd);
-		return -1;
-	}
-	dst.sin_family = AF_INET;
-	dst.sin_port = htons(5555);
-	if (inet_pton(AF_INET, "10.99.0.2", &dst.sin_addr) != 1 ||
-	    connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
-		perror("connect UDP bench");
-		close(fd);
-		return -1;
-	}
-	return fd;
-}
-
-static int send_udp_payload(int fd, size_t payload_len)
-{
-	char payload[1600];
-	ssize_t ret;
-
-	if (payload_len > sizeof(payload))
-		return -1;
-	memset(payload, 'P', payload_len);
-	ret = send(fd, payload, payload_len, 0);
-	if (ret != (ssize_t)payload_len) {
-		if (ret < 0)
-			perror("send UDP bench");
-		else
-			fprintf(stderr, "short UDP bench send: %zd/%zu\n", ret,
-				payload_len);
-		return -1;
-	}
-	return 0;
-}
-
-static int send_udp_gso_payload(int fd)
-{
-	char payload[GSO_SIZE * 3] = { 0 };
-	char control[CMSG_SPACE(sizeof(uint16_t))] = { 0 };
-	struct msghdr msg = { 0 };
-	struct cmsghdr *cmsg;
-	struct iovec iov;
-	uint16_t gso_size = GSO_SIZE;
-	ssize_t ret;
-
-	for (size_t i = 0; i < sizeof(payload); i++)
-		payload[i] = (char)('a' + (i % 26));
-
-	iov.iov_base = payload;
-	iov.iov_len = sizeof(payload);
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = control;
-	msg.msg_controllen = sizeof(control);
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_UDP;
-	cmsg->cmsg_type = UDP_SEGMENT;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(gso_size));
-	memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
-
-	ret = sendmsg(fd, &msg, 0);
-	if (ret != (ssize_t)sizeof(payload)) {
-		if (ret < 0)
-			perror("sendmsg UDP bench GSO");
-		else
-			fprintf(stderr, "short UDP bench GSO send: %zd/%zu\n",
-				ret, sizeof(payload));
-		return -1;
-	}
-	return 0;
-}
-
 static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 				    struct packet_meta *meta)
 {
@@ -1128,16 +930,14 @@ static int read_udp_scalar_from_tun(int tun_fd, size_t *packet_len,
 	return -1;
 }
 
-static int read_prepended_udp_from_tun(int tun_fd, uint32_t expected_mark,
-				       size_t *packet_len)
+static int read_mpls_udp_from_tun(int tun_fd, uint32_t expected_mark,
+				  size_t *packet_len, struct packet_meta *meta)
 {
 	uint8_t buf[2048];
-	uint32_t mark_be;
 
 	for (int i = 0; i < 256; i++) {
 		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
-		uint8_t *mark = buf + 4 + sizeof(*hdr);
-		uint8_t *ip = mark + 4;
+		struct mpls_packet_meta mpls_meta;
 		ssize_t n = read(tun_fd, buf, sizeof(buf));
 
 		if (n < 0) {
@@ -1145,41 +945,42 @@ static int read_prepended_udp_from_tun(int tun_fd, uint32_t expected_mark,
 				usleep(1000);
 				continue;
 			}
-			perror("read prepended UDP from TUN");
+			perror("read MPLS UDP from TUN");
 			return -1;
 		}
 		if (n < 4 + (ssize_t)sizeof(*hdr) + 4 + 28)
 			continue;
 		if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE)
 			continue;
-		memcpy(&mark_be, mark, sizeof(mark_be));
-		if (ntohl(mark_be) != expected_mark)
+		if (parse_mpls_tun_packet_meta(buf, n, &mpls_meta))
 			continue;
-		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_UDP)
+		if (mpls_meta.mark != expected_mark ||
+		    mpls_meta.packet.ip_proto != IPPROTO_UDP)
 			continue;
+		if (meta)
+			*meta = mpls_meta.packet;
 		*packet_len = (size_t)n;
 		return 0;
 	}
 
-	fprintf(stderr, "prepended UDP packet not read from TUN\n");
+	fprintf(stderr, "MPLS UDP packet not read from TUN\n");
 	return -1;
 }
 
-static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
-				       struct tcp_packet *packet,
-				       uint32_t *payload_len,
-				       size_t *packet_len,
-				       uint8_t required_flags,
-				       bool require_payload)
+static int read_mpls_tcp_from_tun(int tun_fd, uint32_t expected_mark,
+				  struct tcp_packet *packet,
+				  uint32_t *payload_len,
+				  size_t *packet_len,
+				  uint8_t required_flags,
+				  bool require_payload)
 {
 	uint8_t buf[4096];
 	uint8_t last_gso_type = 0;
-	uint32_t mark_be;
 
 	for (int i = 0; i < 512; i++) {
 		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
-		uint8_t *mark = buf + 4 + sizeof(*hdr);
-		uint8_t *ip = mark + 4;
+		uint8_t *ip = buf + 4 + sizeof(*hdr) + 4;
+		struct mpls_packet_meta mpls_meta;
 		uint8_t *tcp;
 		uint16_t total_len;
 		uint8_t ihl, thl;
@@ -1191,7 +992,7 @@ static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
 				usleep(1000);
 				continue;
 			}
-			perror("read prepended TCP from TUN");
+			perror("read MPLS TCP from TUN");
 			return -1;
 		}
 		if (n < 4 + (ssize_t)sizeof(*hdr) + 4 + 40)
@@ -1199,10 +1000,10 @@ static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
 		last_gso_type = hdr->gso_type;
 		if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE)
 			continue;
-		memcpy(&mark_be, mark, sizeof(mark_be));
-		if (ntohl(mark_be) != expected_mark)
+		if (parse_mpls_tun_packet_meta(buf, n, &mpls_meta))
 			continue;
-		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_TCP)
+		if (mpls_meta.mark != expected_mark ||
+		    mpls_meta.packet.ip_proto != IPPROTO_TCP)
 			continue;
 		ihl = (ip[0] & 0x0f) * 4;
 		if (ihl < 20 || n < 4 + (ssize_t)sizeof(*hdr) + 4 + ihl + 20)
@@ -1229,7 +1030,7 @@ static int read_prepended_tcp_from_tun(int tun_fd, uint32_t expected_mark,
 		return 0;
 	}
 
-	fprintf(stderr, "prepended TCP packet not read from TUN; last gso_type=%u\n",
+	fprintf(stderr, "MPLS TCP packet not read from TUN; last gso_type=%u\n",
 		last_gso_type);
 	return -1;
 }
@@ -1335,61 +1136,6 @@ static int read_tcp_gso_data_from_tun(int tun_fd, size_t *packet_len,
 	return -1;
 }
 
-static int read_tcp_data_from_tun(int tun_fd, size_t *packet_len,
-				  struct tcp_packet *packet,
-				  uint32_t *payload_len)
-{
-	uint8_t buf[131072];
-
-	for (int i = 0; i < 512; i++) {
-		struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)(buf + 4);
-		uint8_t *ip = buf + 4 + sizeof(*hdr);
-		uint8_t *tcp;
-		uint16_t total_len;
-		uint8_t ihl, thl;
-		uint32_t plen;
-		ssize_t n = read(tun_fd, buf, sizeof(buf));
-
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(1000);
-				continue;
-			}
-			perror("read TCP data from TUN");
-			return -1;
-		}
-		if (n < 4 + (ssize_t)sizeof(*hdr) + 40)
-			continue;
-		if ((ip[0] >> 4) != 4 || ip[9] != IPPROTO_TCP)
-			continue;
-		ihl = (ip[0] & 0x0f) * 4;
-		if (ihl < 20 || n < 4 + (ssize_t)sizeof(*hdr) + ihl + 20)
-			continue;
-		tcp = ip + ihl;
-		thl = (tcp[12] >> 4) * 4;
-		total_len = ((uint16_t)ip[2] << 8) | ip[3];
-		if (thl < 20 || total_len < ihl + thl)
-			continue;
-		plen = total_len - ihl - thl;
-		if (!plen)
-			continue;
-
-		memcpy(&packet->saddr, ip + 12, sizeof(packet->saddr));
-		memcpy(&packet->daddr, ip + 16, sizeof(packet->daddr));
-		packet->sport = ((uint16_t)tcp[0] << 8) | tcp[1];
-		packet->dport = ((uint16_t)tcp[2] << 8) | tcp[3];
-		packet->seq = ntohl(*(uint32_t *)(tcp + 4));
-		packet->flags = tcp[13];
-		*payload_len = plen;
-		*packet_len = (size_t)n;
-		(void)hdr;
-		return 0;
-	}
-
-	fprintf(stderr, "TCP data packet not read from TUN\n");
-	return -1;
-}
-
 static uint64_t now_ns(void)
 {
 	struct timespec ts;
@@ -1398,15 +1144,12 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
-static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
+static int run_udp_gso_bench_case(const char *obj_path, bool with_mpls,
 				  int iterations, double *gbps,
-				  unsigned int *events)
+				  unsigned int *segments)
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
-	struct ring_buffer *rb = NULL;
-	struct event_state state = { 0 };
-	struct bpf_map *map;
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1419,14 +1162,10 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
 		goto out;
 
-	if (with_bpf) {
+	if (with_mpls) {
+		if (configure_mpls_encap_route(DEV_NAME))
+			goto out;
 		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
-			goto out;
-		map = bpf_object__find_map_by_name(obj, "fwmark_events");
-		if (!map)
-			goto out;
-		rb = ring_buffer__new(bpf_map__fd(map), handle_event, &state, NULL);
-		if (!rb)
 			goto out;
 	}
 
@@ -1437,24 +1176,27 @@ static int run_udp_gso_bench_case(const char *obj_path, bool with_bpf,
 
 		if (send_marked_udp_gso())
 			goto out;
-		if (with_bpf && poll_until_read_events(rb, &state, i + 1))
-			goto out;
-		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-				      &packet_len, &gso_size, NULL))
-			goto out;
-		total_bytes += packet_len;
+		if (with_mpls) {
+			for (int seg = 0; seg < 3; seg++) {
+				if (read_mpls_udp_from_tun(tun_fd, EXPECTED_MARK,
+							   &packet_len, NULL))
+					goto out;
+				total_bytes += packet_len - 4;
+			}
+		} else {
+			if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
+					      &packet_len, &gso_size, NULL))
+				goto out;
+			total_bytes += packet_len;
+		}
 	}
 	end = now_ns();
 
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	*events = state.read_events;
-	if (with_bpf && assert_no_drops(obj))
-		goto out;
+	*segments = with_mpls ? (unsigned int)iterations : 0;
 	err = 0;
 
 out:
-	if (rb)
-		ring_buffer__free(rb);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);
@@ -1466,10 +1208,7 @@ out:
 	return err;
 }
 
-static int run_tcp_gso_burst(int tun_fd, struct ring_buffer *rb,
-			     struct event_state *state,
-			     unsigned int expected_gso_events,
-			     size_t *packet_len)
+static int run_tcp_gso_burst(int tun_fd, bool with_mpls, size_t *packet_len)
 {
 	struct tcp_packet syn = { 0 };
 	struct tcp_packet data = { 0 };
@@ -1481,25 +1220,51 @@ static int run_tcp_gso_burst(int tun_fd, struct ring_buffer *rb,
 	tcp_fd = start_marked_tcp_client();
 	if (tcp_fd < 0)
 		goto out;
-	if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
-		goto out;
+	if (with_mpls) {
+		size_t syn_packet_len = 0;
+
+		if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK, &syn,
+					   &payload_len, &syn_packet_len, 0x02,
+					   false))
+			goto out;
+	} else {
+		if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
+			goto out;
+	}
 	if (write_tcp_synack_to_tun(tun_fd, &syn, false))
 		goto out;
 	if (finish_tcp_connect(tcp_fd))
 		goto out;
 	if (send_tcp_payload_len(tcp_fd, 1460 * 5))
 		goto out;
-	if (rb && poll_until_read_events(rb, state, expected_gso_events))
-		goto out;
-	if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size, &data,
-				       &payload_len, NULL))
-		goto out;
-	if (!gso_size) {
-		fprintf(stderr, "unexpected TCP benchmark GSO size: %u\n", gso_size);
-		goto out;
+	if (with_mpls) {
+		size_t received_payload = 0;
+		size_t total_packet_len = 0;
+
+		while (received_payload < 1460 * 5) {
+			size_t one_packet_len = 0;
+
+			if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK,
+						   &data, &payload_len,
+						   &one_packet_len, 0x10, true))
+				goto out;
+			if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
+				goto out;
+			received_payload += payload_len;
+			total_packet_len += one_packet_len - 4;
+		}
+		*packet_len = total_packet_len;
+	} else {
+		if (read_tcp_gso_data_from_tun(tun_fd, packet_len, &gso_size,
+					       &data, &payload_len, NULL))
+			goto out;
+		if (!gso_size) {
+			fprintf(stderr, "unexpected TCP benchmark GSO size: %u\n", gso_size);
+			goto out;
+		}
+		if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
+			goto out;
 	}
-	if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
-		goto out;
 
 	err = 0;
 
@@ -1509,16 +1274,13 @@ out:
 	return err;
 }
 
-static int run_tcp_gso_bench_case(const char *obj_path, bool with_bpf,
+static int run_tcp_gso_bench_case(const char *obj_path, bool with_mpls,
 				  int iterations, double *gbps,
-				  unsigned int *gso_events,
-				  unsigned int *total_events)
+				  unsigned int *bursts,
+				  unsigned int *segments)
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
-	struct ring_buffer *rb = NULL;
-	struct event_state state = { 0 };
-	struct bpf_map *map;
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1531,14 +1293,10 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_bpf,
 	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
 		goto out;
 
-	if (with_bpf) {
+	if (with_mpls) {
+		if (configure_mpls_encap_route(DEV_NAME))
+			goto out;
 		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
-			goto out;
-		map = bpf_object__find_map_by_name(obj, "fwmark_events");
-		if (!map)
-			goto out;
-		rb = ring_buffer__new(bpf_map__fd(map), handle_event, &state, NULL);
-		if (!rb)
 			goto out;
 	}
 
@@ -1546,22 +1304,18 @@ static int run_tcp_gso_bench_case(const char *obj_path, bool with_bpf,
 	for (int i = 0; i < iterations; i++) {
 		size_t packet_len = 0;
 
-		if (run_tcp_gso_burst(tun_fd, rb, &state, i + 1, &packet_len))
+		if (run_tcp_gso_burst(tun_fd, with_mpls, &packet_len))
 			goto out;
 		total_bytes += packet_len;
 	}
 	end = now_ns();
 
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	*gso_events = state.read_events;
-	*total_events = state.total_read_events;
-	if (with_bpf && assert_no_drops(obj))
-		goto out;
+	*bursts = with_mpls ? (unsigned int)iterations : 0;
+	*segments = *bursts;
 	err = 0;
 
 out:
-	if (rb)
-		ring_buffer__free(rb);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);
@@ -1573,16 +1327,13 @@ out:
 	return err;
 }
 
-static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
+static int run_mixed_bench_case(const char *obj_path, bool with_mpls,
 				int iterations, double *gbps,
-				unsigned int *gso_events,
-				unsigned int *total_events)
+				unsigned int *bursts,
+				unsigned int *segments)
 {
 	struct tc_attachment egress = { 0 };
 	struct bpf_object *obj = NULL;
-	struct ring_buffer *rb = NULL;
-	struct event_state state = { 0 };
-	struct bpf_map *map;
 	size_t total_bytes = 0;
 	uint64_t start, end;
 	int tun_fd = -1;
@@ -1595,14 +1346,10 @@ static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
 	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
 		goto out;
 
-	if (with_bpf) {
+	if (with_mpls) {
+		if (configure_mpls_encap_route(DEV_NAME))
+			goto out;
 		if (attach_read_bpf(DEV_NAME, obj_path, &obj, &egress))
-			goto out;
-		map = bpf_object__find_map_by_name(obj, "fwmark_events");
-		if (!map)
-			goto out;
-		rb = ring_buffer__new(bpf_map__fd(map), handle_event, &state, NULL);
-		if (!rb)
 			goto out;
 	}
 
@@ -1613,38 +1360,45 @@ static int run_mixed_bench_case(const char *obj_path, bool with_bpf,
 
 		if (send_udp_datagram(SECOND_MARK, 64))
 			goto out;
-		if (rb)
-			ring_buffer__poll(rb, 0);
-		if (read_udp_scalar_from_tun(tun_fd, &packet_len, NULL))
-			goto out;
-		total_bytes += packet_len;
+		if (with_mpls) {
+			if (read_mpls_udp_from_tun(tun_fd, SECOND_MARK,
+						   &packet_len, NULL))
+				goto out;
+			total_bytes += packet_len - 4;
+		} else {
+			if (read_udp_scalar_from_tun(tun_fd, &packet_len, NULL))
+				goto out;
+			total_bytes += packet_len;
+		}
 
 		if (send_marked_udp_gso())
 			goto out;
-		if (rb && poll_until_read_events(rb, &state, (i * 2) + 1))
-			goto out;
-		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-				      &packet_len, &gso_size, NULL))
-			goto out;
-		total_bytes += packet_len;
+		if (with_mpls) {
+			for (int seg = 0; seg < 3; seg++) {
+				if (read_mpls_udp_from_tun(tun_fd, EXPECTED_MARK,
+							   &packet_len, NULL))
+					goto out;
+				total_bytes += packet_len - 4;
+			}
+		} else {
+			if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
+					      &packet_len, &gso_size, NULL))
+				goto out;
+			total_bytes += packet_len;
+		}
 
-		if (run_tcp_gso_burst(tun_fd, rb, &state, (i * 2) + 2,
-				      &packet_len))
+		if (run_tcp_gso_burst(tun_fd, with_mpls, &packet_len))
 			goto out;
 		total_bytes += packet_len;
 	}
 	end = now_ns();
 
 	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	*gso_events = state.read_events;
-	*total_events = state.total_read_events;
-	if (with_bpf && assert_no_drops(obj))
-		goto out;
+	*bursts = with_mpls ? (unsigned int)iterations * 2 : 0;
+	*segments = with_mpls ? (unsigned int)iterations * 3 : 0;
 	err = 0;
 
 out:
-	if (rb)
-		ring_buffer__free(rb);
 	if (obj) {
 		bpf_tc_detach(&egress.hook, &egress.opts);
 		bpf_tc_hook_destroy(&egress.hook);
@@ -1659,505 +1413,6 @@ out:
 static double drop_percent(double baseline, double fwmark)
 {
 	return baseline > 0.0 ? (baseline - fwmark) * 100.0 / baseline : 0.0;
-}
-
-static int run_prepend_correctness(const char *obj_path)
-{
-	struct tc_attachment egress = { 0 };
-	struct bpf_object *obj = NULL;
-	size_t packet_len = 0;
-	int tun_fd = -1;
-	int err = 1;
-
-	if (enter_new_netns())
-		return 1;
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = open_vnet_tun(DEV_NAME);
-	if (tun_fd < 0)
-		goto out;
-	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
-		goto out;
-	if (attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
-			       &obj, &egress))
-		goto out;
-	if (send_udp_datagram(EXPECTED_MARK, 128))
-		goto out;
-	if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK, &packet_len))
-		goto out;
-	printf("PREPEND_READ_PATH_UDP_SCALAR: mark=0x%08x tun_len=%zu\n",
-	       EXPECTED_MARK, packet_len);
-	err = 0;
-
-out:
-	if (obj) {
-		bpf_tc_detach(&egress.hook, &egress.opts);
-		bpf_tc_hook_destroy(&egress.hook);
-		bpf_object__close(obj);
-	}
-	if (tun_fd >= 0)
-		close(tun_fd);
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	return err;
-}
-
-static int run_prepend_bench_case(const char *obj_path, bool with_bpf,
-				  int iterations, double *gbps)
-{
-	struct tc_attachment egress = { 0 };
-	struct bpf_object *obj = NULL;
-	size_t total_bytes = 0;
-	uint64_t start, end;
-	int tun_fd = -1, udp_fd = -1;
-	int err = -1;
-
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = open_vnet_tun(DEV_NAME);
-	if (tun_fd < 0)
-		goto out;
-	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
-		goto out;
-	if (with_bpf && attach_egress_prog(DEV_NAME, obj_path,
-					   "tun_read_path_prepend_mark", &obj,
-					   &egress))
-		goto out;
-	udp_fd = open_udp_sender(EXPECTED_MARK);
-	if (udp_fd < 0)
-		goto out;
-
-	start = now_ns();
-	for (int i = 0; i < iterations; i++) {
-		size_t packet_len = 0;
-
-		if (send_udp_payload(udp_fd, 256))
-			goto out;
-		if (with_bpf) {
-			if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK,
-							&packet_len))
-				goto out;
-			packet_len -= 4;
-		} else if (read_udp_scalar_from_tun(tun_fd, &packet_len, NULL)) {
-			goto out;
-		}
-		total_bytes += packet_len;
-	}
-	end = now_ns();
-
-	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	err = 0;
-
-out:
-	if (udp_fd >= 0)
-		close(udp_fd);
-	if (obj) {
-		bpf_tc_detach(&egress.hook, &egress.opts);
-		bpf_tc_hook_destroy(&egress.hook);
-		bpf_object__close(obj);
-	}
-	if (tun_fd >= 0)
-		close(tun_fd);
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	return err;
-}
-
-static int run_prepend_bench(const char *obj_path, int iterations)
-{
-	double baseline = 0.0, prepend = 0.0;
-
-	if (run_prepend_correctness(obj_path))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_prepend_bench_case(obj_path, false, iterations, &baseline))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_prepend_bench_case(obj_path, true, iterations, &prepend))
-		return 1;
-
-	printf("BENCH_PREPEND_UDP_SCALAR baseline=%.3f Gbit/s prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
-	       baseline, prepend, drop_percent(baseline, prepend), iterations);
-	return 0;
-}
-
-static int run_nogso_prepend_udp_case(const char *obj_path, int iterations,
-				      double *gbps)
-{
-	struct tc_attachment egress = { 0 };
-	struct bpf_object *obj = NULL;
-	size_t total_bytes = 0;
-	uint64_t start, end;
-	int tun_fd = -1, udp_fd = -1;
-	int err = -1;
-
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = open_vnet_tun_no_offloads(DEV_NAME);
-	if (tun_fd < 0)
-		goto out;
-	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
-		goto out;
-	if (attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
-			       &obj, &egress))
-		goto out;
-	udp_fd = open_udp_sender(EXPECTED_MARK);
-	if (udp_fd < 0)
-		goto out;
-
-	start = now_ns();
-	for (int i = 0; i < iterations; i++) {
-		for (int seg = 0; seg < 3; seg++) {
-			size_t packet_len = 0;
-
-			if (send_udp_payload(udp_fd, GSO_SIZE))
-				goto out;
-			if (read_prepended_udp_from_tun(tun_fd, EXPECTED_MARK,
-							&packet_len))
-				goto out;
-			total_bytes += packet_len - 4;
-		}
-	}
-	end = now_ns();
-
-	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	err = 0;
-
-out:
-	if (udp_fd >= 0)
-		close(udp_fd);
-	if (obj) {
-		bpf_tc_detach(&egress.hook, &egress.opts);
-		bpf_tc_hook_destroy(&egress.hook);
-		bpf_object__close(obj);
-	}
-	if (tun_fd >= 0)
-		close(tun_fd);
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	return err;
-}
-
-static int run_gso_udp_persistent_baseline_case(int iterations, double *gbps)
-{
-	size_t total_bytes = 0;
-	uint64_t start, end;
-	int tun_fd = -1, udp_fd = -1;
-	int err = -1;
-
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = open_vnet_tun(DEV_NAME);
-	if (tun_fd < 0)
-		goto out;
-	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
-		goto out;
-	udp_fd = open_udp_sender(EXPECTED_MARK);
-	if (udp_fd < 0)
-		goto out;
-
-	start = now_ns();
-	for (int i = 0; i < iterations; i++) {
-		size_t packet_len = 0;
-		uint16_t gso_size = 0;
-
-		if (send_udp_gso_payload(udp_fd))
-			goto out;
-		if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-				      &packet_len, &gso_size, NULL))
-			goto out;
-		total_bytes += packet_len;
-	}
-	end = now_ns();
-
-	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	err = 0;
-
-out:
-	if (udp_fd >= 0)
-		close(udp_fd);
-	if (tun_fd >= 0)
-		close(tun_fd);
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	return err;
-}
-
-static int send_tcp_payload_blocking(int fd, size_t payload_len)
-{
-	char payload[16384];
-	size_t sent = 0;
-	int flags;
-
-	flags = fcntl(fd, F_GETFL, 0);
-	if (flags >= 0)
-		fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-	memset(payload, 'S', sizeof(payload));
-
-	while (sent < payload_len) {
-		size_t chunk = payload_len - sent;
-		ssize_t n;
-
-		if (chunk > sizeof(payload))
-			chunk = sizeof(payload);
-		n = send(fd, payload, chunk, MSG_NOSIGNAL);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("send TCP stream payload");
-			return -1;
-		}
-		if (n == 0)
-			return -1;
-		sent += (size_t)n;
-	}
-	return 0;
-}
-
-static int run_tcp_stream_bench_case(const char *obj_path, bool disable_offloads,
-				     bool prepend_mark, int iterations,
-				     double *gbps)
-{
-	struct tc_attachment egress = { 0 };
-	struct bpf_object *obj = NULL;
-	struct tcp_packet syn = { 0 };
-	uint32_t mss = prepend_mark ? 1456 : 1460;
-	size_t total_bytes = 0;
-	size_t target_payload = (size_t)iterations * mss * 5;
-	size_t received_payload = 0;
-	bool debug_tcp = getenv("DEBUG_TCP_STREAM") != NULL;
-	uint32_t last_seq = 0;
-	unsigned int packet_count = 0;
-	unsigned int duplicate_count = 0;
-	uint64_t start, read_done = 0, end;
-	int tun_fd = -1, tcp_fd = -1;
-	int start_pipe[2] = { -1, -1 };
-	pid_t child = -1;
-	int status = 0;
-	int err = -1;
-
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	tun_fd = disable_offloads ? open_vnet_tun_no_offloads(DEV_NAME) :
-				    open_vnet_tun(DEV_NAME);
-	if (tun_fd < 0)
-		goto out;
-	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
-		goto out;
-	if (prepend_mark &&
-	    attach_egress_prog(DEV_NAME, obj_path, "tun_read_path_prepend_mark",
-			       &obj, &egress))
-		goto out;
-
-	tcp_fd = start_marked_tcp_client();
-	if (tcp_fd < 0)
-		goto out;
-	if (prepend_mark) {
-		uint32_t payload_len = 0;
-		size_t packet_len = 0;
-
-		if (read_prepended_tcp_from_tun(tun_fd, EXPECTED_MARK, &syn,
-						&payload_len, &packet_len, 0x02,
-						false))
-			goto out;
-	} else if (read_tcp_control_from_tun(tun_fd, &syn, 0x02)) {
-		goto out;
-	}
-	if (write_tcp_synack_mss_to_tun(tun_fd, &syn, false, mss))
-		goto out;
-	if (finish_tcp_connect(tcp_fd))
-		goto out;
-	if (pipe(start_pipe) < 0) {
-		perror("pipe TCP sender");
-		goto out;
-	}
-
-	child = fork();
-	if (child < 0) {
-		perror("fork TCP sender");
-		goto out;
-	}
-	if (child == 0) {
-		char token;
-		int rc;
-
-		close(start_pipe[1]);
-		if (read(start_pipe[0], &token, 1) != 1)
-			_exit(1);
-		close(start_pipe[0]);
-		rc = send_tcp_payload_blocking(tcp_fd, target_payload);
-		_exit(rc ? 1 : 0);
-	}
-	close(start_pipe[0]);
-	start_pipe[0] = -1;
-	start = now_ns();
-	if (write(start_pipe[1], "x", 1) != 1) {
-		perror("start TCP sender");
-		goto out;
-	}
-	close(start_pipe[1]);
-	start_pipe[1] = -1;
-
-	while (received_payload < target_payload) {
-		struct tcp_packet data = { 0 };
-		uint32_t payload_len = 0;
-		size_t packet_len = 0;
-
-		if (prepend_mark) {
-			if (read_prepended_tcp_from_tun(tun_fd, EXPECTED_MARK,
-							&data, &payload_len,
-							&packet_len, 0x10, true))
-				goto out;
-			packet_len -= 4;
-		} else {
-			if (read_tcp_data_from_tun(tun_fd, &packet_len, &data,
-						   &payload_len))
-				goto out;
-		}
-		if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
-			goto out;
-		if (debug_tcp && packet_count < 32) {
-			fprintf(stderr,
-				"TCPDBG prepend=%d t_ms=%.3f seq=%u payload=%u packet_len=%zu flags=0x%02x\n",
-				prepend_mark,
-				(double)(now_ns() - start) / 1000000.0,
-				data.seq, payload_len, packet_len, data.flags);
-		}
-		if (packet_count && data.seq == last_seq)
-			duplicate_count++;
-		last_seq = data.seq;
-		packet_count++;
-		received_payload += payload_len;
-		total_bytes += packet_len;
-	}
-	read_done = now_ns();
-
-	if (waitpid(child, &status, 0) < 0) {
-		perror("waitpid TCP sender");
-		goto out;
-	}
-	child = -1;
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		fprintf(stderr, "TCP sender child failed\n");
-		goto out;
-	}
-	end = now_ns();
-
-	*gbps = (double)total_bytes * 8.0 / (double)(end - start);
-	if (debug_tcp)
-		fprintf(stderr,
-			"TCPDBG prepend=%d packets=%u duplicates=%u received_payload=%zu target=%zu total_bytes=%zu elapsed_ms=%.3f\n",
-			prepend_mark, packet_count, duplicate_count,
-			received_payload, target_payload, total_bytes,
-			(double)(end - start) / 1000000.0);
-	if (debug_tcp)
-		fprintf(stderr,
-			"TCPDBG prepend=%d read_ms=%.3f wait_ms=%.3f\n",
-			prepend_mark, (double)(read_done - start) / 1000000.0,
-			(double)(end - read_done) / 1000000.0);
-	err = 0;
-
-out:
-	if (child > 0) {
-		kill(child, SIGKILL);
-		waitpid(child, NULL, 0);
-	}
-	if (start_pipe[0] >= 0)
-		close(start_pipe[0]);
-	if (start_pipe[1] >= 0)
-		close(start_pipe[1]);
-	if (tcp_fd >= 0)
-		close(tcp_fd);
-	if (obj) {
-		bpf_tc_detach(&egress.hook, &egress.opts);
-		bpf_tc_hook_destroy(&egress.hook);
-		bpf_object__close(obj);
-	}
-	if (tun_fd >= 0)
-		close(tun_fd);
-	run_cmd_quiet("ip link del " DEV_NAME " >/dev/null 2>&1");
-	return err;
-}
-
-static int run_nogso_prepend_bench(const char *obj_path, int iterations)
-{
-	double base_udp = 0.0, nogso_udp = 0.0;
-	double base_tcp = 0.0, nogso_tcp = 0.0;
-
-	if (enter_new_netns())
-		return 1;
-	if (run_gso_udp_persistent_baseline_case(iterations, &base_udp))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_nogso_prepend_udp_case(obj_path, iterations, &nogso_udp))
-		return 1;
-
-	printf("BENCH_NOGSO_PREPEND_UDP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
-	       base_udp, nogso_udp, drop_percent(base_udp, nogso_udp), iterations);
-
-	int tcp_baseline_iterations = iterations < 2000 ? 2000 : iterations;
-
-	if (enter_new_netns())
-		return 1;
-	if (run_tcp_gso_bench_case(obj_path, false, tcp_baseline_iterations,
-				   &base_tcp, &(unsigned int){ 0 },
-				   &(unsigned int){ 0 }))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_tcp_stream_bench_case(obj_path, true, true, iterations, &nogso_tcp))
-		return 1;
-
-	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
-	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
-	       base_tcp * 1000.0, nogso_tcp * 1000.0, tcp_baseline_iterations,
-	       iterations);
-	return 0;
-}
-
-static int run_nogso_prepend_udp_bench(const char *obj_path, int iterations)
-{
-	double base_udp = 0.0, nogso_udp = 0.0;
-
-	if (enter_new_netns())
-		return 1;
-	if (run_gso_udp_persistent_baseline_case(iterations, &base_udp))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_nogso_prepend_udp_case(obj_path, iterations, &nogso_udp))
-		return 1;
-	printf("BENCH_NOGSO_PREPEND_UDP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% iterations=%d\n",
-	       base_udp, nogso_udp, drop_percent(base_udp, nogso_udp), iterations);
-	return 0;
-}
-
-static int run_nogso_prepend_tcp_bench(const char *obj_path, int iterations)
-{
-	double base_tcp = 0.0, nogso_tcp = 0.0;
-	int baseline_iterations = iterations < 2000 ? 2000 : iterations;
-
-	if (enter_new_netns())
-		return 1;
-	if (run_tcp_gso_bench_case(obj_path, false, baseline_iterations, &base_tcp,
-				   &(unsigned int){ 0 }, &(unsigned int){ 0 }))
-		return 1;
-	if (enter_new_netns())
-		return 1;
-	if (run_tcp_stream_bench_case(obj_path, true, true, iterations, &nogso_tcp))
-		return 1;
-	printf("BENCH_NOGSO_PREPEND_TCP baseline_gso=%.3f Gbit/s nogso_prepend=%.3f Gbit/s drop=%.1f%% baseline_mbps=%.2f nogso_mbps=%.2f baseline_iterations=%d nogso_iterations=%d\n",
-	       base_tcp, nogso_tcp, drop_percent(base_tcp, nogso_tcp),
-	       base_tcp * 1000.0, nogso_tcp * 1000.0, baseline_iterations,
-	       iterations);
-	return 0;
-}
-
-static int run_tcp_stream_nogso_plain_bench(const char *obj_path, int iterations)
-{
-	double gbps = 0.0;
-
-	if (enter_new_netns())
-		return 1;
-	if (run_tcp_stream_bench_case(obj_path, true, false, iterations, &gbps))
-		return 1;
-	printf("BENCH_TCP_STREAM_NOGSO_PLAIN throughput=%.3f Gbit/s mbps=%.2f iterations=%d\n",
-	       gbps, gbps * 1000.0, iterations);
-	return 0;
 }
 
 static int enter_new_netns(void)
@@ -2175,58 +1430,58 @@ static int run_bench(const char *obj_path, int iterations)
 	double base_udp = 0.0, fwmark_udp = 0.0;
 	double base_tcp = 0.0, fwmark_tcp = 0.0;
 	double base_mixed = 0.0, fwmark_mixed = 0.0;
-	unsigned int baseline_events = 0, fwmark_events = 0;
-	unsigned int baseline_total = 0, fwmark_total = 0;
+	unsigned int baseline_bursts = 0, fwmark_bursts = 0;
+	unsigned int baseline_segments = 0, fwmark_segments = 0;
 
 	if (enter_new_netns())
 		return 1;
 	if (run_udp_gso_bench_case(obj_path, false, iterations, &base_udp,
-				   &baseline_events))
+				   &baseline_bursts))
 		return 1;
 	if (enter_new_netns())
 		return 1;
 	if (run_udp_gso_bench_case(obj_path, true, iterations, &fwmark_udp,
-				   &fwmark_events))
+				   &fwmark_bursts))
 		return 1;
 
-	printf("BENCH_UDP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% events=%u/%d\n",
+	printf("BENCH_UDP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% segments=%u/%d\n",
 	       base_udp, fwmark_udp, drop_percent(base_udp, fwmark_udp),
-	       fwmark_events, iterations);
-	if (fwmark_events != (unsigned int)iterations)
+	       fwmark_bursts, iterations);
+	if (fwmark_bursts != (unsigned int)iterations)
 		return 1;
 
 	if (enter_new_netns())
 		return 1;
 	if (run_tcp_gso_bench_case(obj_path, false, iterations, &base_tcp,
-				   &baseline_events, &baseline_total))
+				   &baseline_bursts, &baseline_segments))
 		return 1;
 	if (enter_new_netns())
 		return 1;
 	if (run_tcp_gso_bench_case(obj_path, true, iterations, &fwmark_tcp,
-				   &fwmark_events, &fwmark_total))
+				   &fwmark_bursts, &fwmark_segments))
 		return 1;
 
-	printf("BENCH_TCP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% gso_events=%u/%d total_events=%u\n",
+	printf("BENCH_TCP_GSO baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% bursts=%u/%d segments=%u\n",
 	       base_tcp, fwmark_tcp, drop_percent(base_tcp, fwmark_tcp),
-	       fwmark_events, iterations, fwmark_total);
-	if (fwmark_events != (unsigned int)iterations)
+	       fwmark_bursts, iterations, fwmark_segments);
+	if (fwmark_bursts != (unsigned int)iterations)
 		return 1;
 
 	if (enter_new_netns())
 		return 1;
 	if (run_mixed_bench_case(obj_path, false, iterations, &base_mixed,
-				 &baseline_events, &baseline_total))
+				 &baseline_bursts, &baseline_segments))
 		return 1;
 	if (enter_new_netns())
 		return 1;
 	if (run_mixed_bench_case(obj_path, true, iterations, &fwmark_mixed,
-				 &fwmark_events, &fwmark_total))
+				 &fwmark_bursts, &fwmark_segments))
 		return 1;
 
-	printf("BENCH_MIXED baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% gso_events=%u/%d total_events=%u\n",
+	printf("BENCH_MIXED baseline=%.3f Gbit/s fwmark=%.3f Gbit/s drop=%.1f%% bursts=%u/%d segments=%u\n",
 	       base_mixed, fwmark_mixed, drop_percent(base_mixed, fwmark_mixed),
-	       fwmark_events, iterations * 2, fwmark_total);
-	if (fwmark_events != (unsigned int)iterations * 2)
+	       fwmark_bursts, iterations * 2, fwmark_segments);
+	if (fwmark_bursts != (unsigned int)iterations * 2)
 		return 1;
 	return 0;
 }
@@ -2236,48 +1491,21 @@ int main(int argc, char **argv)
 	const char *obj_path = BPF_OBJ;
 	struct tc_attachment ingress = { 0 }, egress = { 0 };
 	struct bpf_object *obj = NULL;
-	struct ring_buffer *rb = NULL;
-	struct event_state state = { 0 };
-	struct bpf_map *map;
+	struct fwmark_sample write_sample = { 0 };
+	struct fwmark_sample write_gso_sample = { 0 };
 	struct packet_meta scalar_meta = { 0 }, zero_meta = { 0 };
 	struct packet_meta udp_gso_meta = { 0 }, tcp_gso_meta = { 0 };
 	struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
 	struct tcp_packet syn = { 0 };
 	size_t scalar_packet_len = 0, zero_packet_len = 0;
 	size_t udp_gso_packet_len = 0, tcp_gso_packet_len = 0;
-	uint16_t udp_tun_gso_size = 0, tcp_tun_gso_size = 0;
-	int tun_fd = -1, tcp_fd = -1, map_fd, err = 1;
+	int tun_fd = -1, tcp_fd = -1, err = 1;
 
 	setrlimit(RLIMIT_MEMLOCK, &rlim);
 	if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
 		int iterations = argc > 2 ? atoi(argv[2]) : 2000;
 
 		return run_bench(obj_path, iterations);
-	}
-	if (argc > 1 && strcmp(argv[1], "--bench-prepend") == 0) {
-		int iterations = argc > 2 ? atoi(argv[2]) : 20000;
-
-		return run_prepend_bench(obj_path, iterations);
-	}
-	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend") == 0) {
-		int iterations = argc > 2 ? atoi(argv[2]) : 10;
-
-		return run_nogso_prepend_bench(obj_path, iterations);
-	}
-	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend-udp") == 0) {
-		int iterations = argc > 2 ? atoi(argv[2]) : 5000;
-
-		return run_nogso_prepend_udp_bench(obj_path, iterations);
-	}
-	if (argc > 1 && strcmp(argv[1], "--bench-nogso-prepend-tcp") == 0) {
-		int iterations = argc > 2 ? atoi(argv[2]) : 10;
-
-		return run_nogso_prepend_tcp_bench(obj_path, iterations);
-	}
-	if (argc > 1 && strcmp(argv[1], "--bench-tcp-stream-nogso-plain") == 0) {
-		int iterations = argc > 2 ? atoi(argv[2]) : 10;
-
-		return run_tcp_stream_nogso_plain_bench(obj_path, iterations);
 	}
 	if (argc > 1)
 		obj_path = argv[1];
@@ -2293,86 +1521,69 @@ int main(int argc, char **argv)
 		goto out;
 	if (configure_tun(DEV_NAME, "10.99.0.1/24"))
 		goto out;
+	if (configure_mpls_encap_route(DEV_NAME))
+		goto out;
 	if (attach_bpf(DEV_NAME, obj_path, &obj, &ingress, &egress))
 		goto out;
 
-	map = bpf_object__find_map_by_name(obj, "fwmark_events");
-	if (!map) {
-		fprintf(stderr, "ringbuf map not found\n");
-		goto out;
-	}
-	map_fd = bpf_map__fd(map);
-	rb = ring_buffer__new(map_fd, handle_event, &state, NULL);
-	if (!rb) {
-		fprintf(stderr, "ring_buffer__new failed\n");
-		goto out;
-	}
-
 	if (write_marked_udp_packet_to_tun(tun_fd))
 		goto out;
-	if (poll_until(rb, &state.write_seen)) {
-		fprintf(stderr, "write-path fwmark event not received\n");
+	if (poll_fwmark_sample(obj, 0, &write_sample)) {
+		fprintf(stderr, "write-path fwmark sample not recorded\n");
+		goto out;
+	}
+	if (write_sample.mark != EXPECTED_MARK || write_sample.gso_size != 0) {
+		fprintf(stderr, "unexpected write-path sample mark=0x%08x gso_size=%u\n",
+			write_sample.mark, write_sample.gso_size);
 		goto out;
 	}
 
 	if (write_marked_udp_gso_to_tun(tun_fd))
 		goto out;
-	if (poll_until(rb, &state.write_gso_seen)) {
-		fprintf(stderr, "write-path UDP GSO fwmark event not received\n");
+	if (poll_fwmark_sample(obj, 1, &write_gso_sample)) {
+		fprintf(stderr, "write-path UDP GSO fwmark sample not recorded\n");
+		goto out;
+	}
+	if (write_gso_sample.mark != EXPECTED_MARK ||
+	    write_gso_sample.gso_size != GSO_SIZE ||
+	    write_gso_sample.ip_proto != IPPROTO_UDP) {
+		fprintf(stderr,
+			"unexpected write-path GSO sample mark=0x%08x gso_size=%u ip_proto=%u\n",
+			write_gso_sample.mark, write_gso_sample.gso_size,
+			write_gso_sample.ip_proto);
 		goto out;
 	}
 
 	if (send_udp_datagram(SECOND_MARK, 64))
 		goto out;
-	if (poll_until(rb, &state.scalar_seen)) {
-		fprintf(stderr, "read-path scalar fwmark event not received\n");
+	if (read_mpls_udp_from_tun(tun_fd, SECOND_MARK, &scalar_packet_len,
+				   &scalar_meta))
 		goto out;
-	}
-	if (read_udp_scalar_from_tun(tun_fd, &scalar_packet_len, &scalar_meta))
-		goto out;
-	if (!event_matches_packet(&state.scalar_event, &scalar_meta)) {
-		fprintf(stderr, "read-path scalar metadata mismatch\n");
-		goto out;
-	}
 
 	if (send_udp_datagram(0, 32))
 		goto out;
-	if (poll_until(rb, &state.zero_seen)) {
-		fprintf(stderr, "read-path zero-mark event not received\n");
+	if (read_mpls_udp_from_tun(tun_fd, 0, &zero_packet_len, &zero_meta))
 		goto out;
-	}
-	if (read_udp_scalar_from_tun(tun_fd, &zero_packet_len, &zero_meta))
-		goto out;
-	if (!event_matches_packet(&state.zero_event, &zero_meta)) {
-		fprintf(stderr, "read-path zero-mark metadata mismatch\n");
-		goto out;
-	}
 
 	if (send_marked_udp_gso())
 		goto out;
-	if (poll_until_read_events(rb, &state, 1)) {
-		fprintf(stderr, "UDP read-path fwmark event not received\n");
-		goto out;
-	}
-	if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_UDP_L4,
-			      &udp_gso_packet_len, &udp_tun_gso_size,
-			      &udp_gso_meta)) {
-		fprintf(stderr, "UDP GSO TUN read failed\n");
-		goto out;
-	}
-	if (!event_matches_packet(&state.udp_read_event, &udp_gso_meta)) {
-		fprintf(stderr, "read-path UDP GSO metadata mismatch\n");
-		goto out;
-	}
-	if (udp_tun_gso_size != GSO_SIZE) {
-		fprintf(stderr, "unexpected UDP TUN GSO size: %u\n", udp_tun_gso_size);
-		goto out;
+	for (int seg = 0; seg < 3; seg++) {
+		size_t one_packet_len = 0;
+
+		if (read_mpls_udp_from_tun(tun_fd, EXPECTED_MARK,
+					   &one_packet_len, &udp_gso_meta)) {
+			fprintf(stderr, "UDP MPLS segment TUN read failed\n");
+			goto out;
+		}
+		udp_gso_packet_len += one_packet_len - 4;
 	}
 
 	tcp_fd = start_marked_tcp_client();
 	if (tcp_fd < 0)
 		goto out;
-	if (read_tcp_control_from_tun(tun_fd, &syn, 0x02))
+	if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK, &syn,
+				   &(uint32_t){ 0 }, &(size_t){ 0 }, 0x02,
+				   false))
 		goto out;
 	if (write_tcp_synack_to_tun(tun_fd, &syn, true))
 		goto out;
@@ -2380,55 +1591,46 @@ int main(int argc, char **argv)
 		goto out;
 	if (send_tcp_payload(tcp_fd))
 		goto out;
-	if (poll_until_read_events(rb, &state, 2)) {
-		fprintf(stderr, "TCP read-path fwmark event not received\n");
-		goto out;
-	}
-	if (read_gso_from_tun(tun_fd, VIRTIO_NET_HDR_GSO_TCPV4,
-			      &tcp_gso_packet_len, &tcp_tun_gso_size,
-			      &tcp_gso_meta)) {
-		fprintf(stderr, "TCP GSO TUN read failed\n");
-		goto out;
-	}
-	if (!event_matches_packet(&state.tcp_read_event, &tcp_gso_meta)) {
-		fprintf(stderr, "read-path TCP GSO metadata mismatch\n");
-		goto out;
-	}
-	if (event_matches_packet(&state.udp_read_event, &tcp_gso_meta) ||
-	    event_matches_packet(&state.tcp_read_event, &udp_gso_meta)) {
-		fprintf(stderr, "metadata mismatch detector accepted crossed events\n");
-		goto out;
-	}
-	if (!tcp_tun_gso_size) {
-		fprintf(stderr, "unexpected TCP TUN GSO size: %u\n", tcp_tun_gso_size);
-		goto out;
-	}
-	if (assert_no_drops(obj))
-		goto out;
+	{
+		size_t received_payload = 0;
 
+		while (received_payload < 1460 * 5) {
+			struct tcp_packet data = { 0 };
+			uint32_t payload_len = 0;
+			size_t one_packet_len = 0;
+
+			if (read_mpls_tcp_from_tun(tun_fd, EXPECTED_MARK,
+						   &data, &payload_len,
+						   &one_packet_len, 0x10, true)) {
+				fprintf(stderr, "TCP MPLS segment TUN read failed\n");
+				goto out;
+			}
+			if (write_tcp_ack_to_tun(tun_fd, &data, payload_len))
+				goto out;
+			received_payload += payload_len;
+			tcp_gso_packet_len += one_packet_len - 4;
+			tcp_gso_meta.gso_size = 0;
+		}
+	}
 	printf("WRITE_PATH: imported mark=0x%08x len=%u\n",
-	       state.write_event.mark, state.write_event.len);
+	       write_sample.mark, write_sample.len);
 	printf("WRITE_PATH_UDP_GSO: imported mark=0x%08x len=%u gso_size=%u gso_segs=%u\n",
-	       state.write_gso_event.mark, state.write_gso_event.len,
-	       state.write_gso_event.gso_size, state.write_gso_event.gso_segs);
-	printf("READ_PATH_UDP_SCALAR: event mark=0x%08x len=%u tun_len=%zu\n",
-	       state.scalar_event.mark, state.scalar_event.len, scalar_packet_len);
-	printf("READ_PATH_ZERO_MARK: event mark=0x%08x len=%u tun_len=%zu\n",
-	       state.zero_event.mark, state.zero_event.len, zero_packet_len);
-	printf("READ_PATH_UDP: event mark=0x%08x len=%u gso_size=%u gso_segs=%u tun_len=%zu\n",
-	       state.udp_read_event.mark, state.udp_read_event.len,
-	       state.udp_read_event.gso_size, state.udp_read_event.gso_segs,
+	       write_gso_sample.mark, write_gso_sample.len,
+	       write_gso_sample.gso_size, write_gso_sample.gso_segs);
+	printf("READ_PATH_MPLS_UDP_SCALAR: mark=0x%08x len=%u tun_len=%zu\n",
+	       SECOND_MARK, scalar_meta.len, scalar_packet_len);
+	printf("READ_PATH_MPLS_ZERO_MARK: mark=0x%08x len=%u tun_len=%zu\n",
+	       0, zero_meta.len, zero_packet_len);
+	printf("READ_PATH_MPLS_UDP_SEGMENTS: mark=0x%08x last_len=%u gso_size=%u tun_len=%zu\n",
+	       EXPECTED_MARK, udp_gso_meta.len, udp_gso_meta.gso_size,
 	       udp_gso_packet_len);
-	printf("READ_PATH_TCP: event mark=0x%08x len=%u gso_size=%u gso_segs=%u tun_len=%zu\n",
-	       state.tcp_read_event.mark, state.tcp_read_event.len,
-	       state.tcp_read_event.gso_size, state.tcp_read_event.gso_segs,
+	printf("READ_PATH_MPLS_TCP_SEGMENTS: mark=0x%08x len=%u gso_size=%u tun_len=%zu\n",
+	       EXPECTED_MARK, tcp_gso_meta.len, tcp_gso_meta.gso_size,
 	       tcp_gso_packet_len);
-	printf("PASS: TUN write path imports fwmark; TUN read path exports fwmark out-of-band while preserving UDP and TCP GSO super-packets\n");
+	printf("PASS: TUN write path imports fwmark; TUN read path exports fwmark in an MPLS shim after route encap; MPLS packets are read as scalar segments on this TUN device\n");
 	err = 0;
 
 out:
-	if (rb)
-		ring_buffer__free(rb);
 	if (obj) {
 		bpf_tc_detach(&ingress.hook, &ingress.opts);
 		bpf_tc_detach(&egress.hook, &egress.opts);

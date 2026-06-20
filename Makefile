@@ -5,7 +5,7 @@ BPF_SRCS := bpf/tun_fwmark.bpf.c
 BPF_OBJS := $(BPF_SRCS:.c=.o)
 POC := scripts/tun_fwmark_poc
 
-.PHONY: all clean test bench bench-prepend bench-nogso-prepend bench-nogso-prepend-udp bench-nogso-prepend-tcp
+.PHONY: all clean test bench
 
 all: $(BPF_OBJS) $(POC)
 
@@ -24,14 +24,3 @@ test: all
 bench: all
 	sudo -n ./$(POC) --bench 2000
 
-bench-prepend: all
-	sudo -n ./$(POC) --bench-prepend 20000
-
-bench-nogso-prepend: all
-	sudo -n ./$(POC) --bench-nogso-prepend 10
-
-bench-nogso-prepend-udp: all
-	sudo -n ./$(POC) --bench-nogso-prepend-udp 5000
-
-bench-nogso-prepend-tcp: all
-	sudo -n ./$(POC) --bench-nogso-prepend-tcp 10

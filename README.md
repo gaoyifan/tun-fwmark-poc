@@ -1,7 +1,7 @@
 # TUN fwmark PoC
 
 This repository contains one Linux-only PoC for carrying `skb->mark` across a
-TUN userspace boundary without breaking TUN GSO/GRO behavior.
+TUN userspace boundary.
 
 The PoC uses a PI-mode `IFF_VNET_HDR` TUN device:
 
@@ -9,19 +9,15 @@ The PoC uses a PI-mode `IFF_VNET_HDR` TUN device:
   A tc ingress BPF program reads the 4-byte big-endian mark, assigns it to
   `skb->mark`, strips the mark bytes, and lets the clean packet enter the kernel
   stack.
-- **TUN Read Path**: tc egress BPF does not modify packet bytes. It emits one
-  ringbuf metadata event per skb/super-packet containing `skb->mark`, `len`,
-  `gso_size`, `gso_segs`, `queue_mapping`, and a packet fingerprint. Userspace
-  reads the normal TUN packet and consumes the matching metadata event out of
-  band. The intended matching model is FIFO per TUN queue, with the fingerprint
-  used to detect desynchronization.
+- **TUN Read Path**: the PoC installs an `ip route ... encap mpls ...` route for
+  the test peer. The kernel pushes an MPLS label stack entry, then tc egress BPF
+  overwrites the top 32-bit MPLS LSE with `skb->mark`. Userspace reads PI +
+  virtio-net header + MPLS LSE + IP packet from the TUN fd and recovers the mark
+  from the LSE.
 
-This avoids the failed designs:
-
-- prepending mark bytes on tc egress can break TCP/GSO packets because it changes
-  protocol header offsets before TUN serializes the virtio header;
-- appending mark bytes with `bpf_skb_change_tail()` is also unsuitable because
-  that helper linearizes the skb and drops offload state.
+This avoids the failed pure-BPF prepend design. eBPF alone cannot set
+`skb->protocol` to `ETH_P_MPLS_UC`, so MPLS push is done by the kernel route
+encap path and eBPF only rewrites the existing LSE.
 
 ## Run
 
@@ -29,21 +25,21 @@ This avoids the failed designs:
 make test
 ```
 
-The test requires `sudo -n` for TUN, tc BPF, and `SO_MARK`.
+The test requires `sudo -n` for TUN, tc BPF, MPLS configuration, and `SO_MARK`.
 
 Expected output:
 
 ```text
 WRITE_PATH: imported mark=0x00000042 ...
 WRITE_PATH_UDP_GSO: imported mark=0x00000042 ... gso_size=1200
-READ_PATH_UDP_SCALAR: event mark=0x00000043 ...
-READ_PATH_ZERO_MARK: event mark=0x00000000 ...
-READ_PATH_UDP: event mark=0x00000042 ... gso_size=1200 gso_segs=3
-READ_PATH_TCP: event mark=0x00000042 ... gso_size=1460 gso_segs=5
-PASS: TUN write path imports fwmark; TUN read path exports fwmark out-of-band while preserving UDP and TCP GSO super-packets
+READ_PATH_MPLS_UDP_SCALAR: mark=0x00000043 ...
+READ_PATH_MPLS_ZERO_MARK: mark=0x00000000 ...
+READ_PATH_MPLS_UDP_SEGMENTS: mark=0x00000042 ...
+READ_PATH_MPLS_TCP_SEGMENTS: mark=0x00000042 ...
+PASS: TUN write path imports fwmark; TUN read path exports fwmark in an MPLS shim after route encap; MPLS packets are read as scalar segments on this TUN device
 ```
 
-For a read-path baseline comparison:
+For a route-encap read-path baseline comparison:
 
 ```sh
 make bench
@@ -55,79 +51,32 @@ The benchmark runs each case in a fresh network namespace:
 - TCP GSO burst packets from a minimal userspace TCP peer;
 - mixed traffic: UDP scalar, UDP GSO, and TCP GSO per iteration.
 
-On the development host, 5000 iterations produced:
+On the development host, 2000 iterations produced:
 
 ```text
-BENCH_UDP_GSO baseline=2.663 Gbit/s fwmark=2.054 Gbit/s drop=22.9% events=5000/5000
-BENCH_TCP_GSO baseline=3.296 Gbit/s fwmark=2.546 Gbit/s drop=22.8% gso_events=5000/5000 total_events=19999
-BENCH_MIXED baseline=2.363 Gbit/s fwmark=1.856 Gbit/s drop=21.5% gso_events=10000/10000 total_events=30741
+BENCH_UDP_GSO baseline=2.726 Gbit/s fwmark=2.348 Gbit/s drop=13.9% segments=2000/2000
+BENCH_TCP_GSO baseline=3.377 Gbit/s fwmark=2.022 Gbit/s drop=40.1% bursts=2000/2000 segments=2000
+BENCH_MIXED baseline=2.470 Gbit/s fwmark=1.826 Gbit/s drop=26.1% bursts=4000/4000 segments=6000
 ```
 
-This measures the side-channel cost in the PoC runner, including ringbuf
-polling, userspace validation, and TCP control-packet metadata events. It is
-intended as a regression/stress check, not a tuned maximum-throughput benchmark.
-
-For comparison, the repo also includes a non-GSO-only direct prepend variant:
-
-```sh
-make bench-prepend
-```
-
-That BPF program rejects GSO skbs and prepends a 4-byte big-endian fwmark before
-the IP packet only for scalar packets. On the development host, 20000 UDP scalar
-packets produced:
-
-```text
-PREPEND_READ_PATH_UDP_SCALAR: mark=0x00000042 tun_len=174
-BENCH_PREPEND_UDP_SCALAR baseline=2.185 Gbit/s prepend=2.005 Gbit/s drop=8.2% iterations=20000
-```
-
-So the direct prepend method is correct for non-GSO packets in this PoC, but it
-is intentionally not a GSO-capable read-path design.
-
-To compare “GSO baseline without fwmark” against “GSO disabled plus direct
-prepend fwmark”:
-
-```sh
-make bench-nogso-prepend-udp
-make bench-nogso-prepend-tcp
-```
-
-On the development host:
-
-```text
-BENCH_NOGSO_PREPEND_UDP baseline_gso=2.527 Gbit/s nogso_prepend=6.850 Gbit/s drop=-171.1% iterations=5000
-BENCH_NOGSO_PREPEND_TCP baseline_gso=1.286 Gbit/s nogso_prepend=0.000 Gbit/s drop=100.0% baseline_mbps=1285.68 nogso_mbps=0.06 baseline_iterations=2000 nogso_iterations=10
-```
-
-The UDP result is specific to this local microbenchmark: no-GSO sends three
-ordinary UDP datagrams, while the GSO baseline uses `UDP_SEGMENT` cmsg. The TCP
-result shows the riskier case: no-GSO plain TCP is slow but still functional in
-this userspace TCP-peer benchmark, while adding tc egress prepend with
-`bpf_skb_adjust_room()` collapses the path to about 0.06 Mbit/s. ftrace/kprobe
-shows the slow path is not packet loss or checksum rejection: ACKs are accepted
-and the advertised send window stays open, but queued TCP data advances through
-`ICSK_TIME_PROBE0` and `tcp_write_wakeup(LINUX_MIB_TCPWINPROBE)` about every
-200 ms. Treat direct prepend as a scalar UDP diagnostic only; TCP read-path
-fwmark should use the ringbuf side-channel path instead.
+On this TUN device, MPLS packets are software-segmented before userspace reads
+them because TUN does not advertise MPLS TSO/USO features through
+`dev->mpls_features`. The fwmark result is therefore a scalar MPLS read-path
+comparison against a GSO baseline, not proof that MPLS preserves TUN GSO
+super-packets.
 
 ## Files
 
 - `bpf/tun_fwmark.bpf.c`: tc ingress/write-path mark import and tc
-  egress/read-path metadata export.
+  egress/read-path MPLS LSE rewrite.
 - `scripts/tun_fwmark_poc.c`: creates a temporary PI+VNET TUN, attaches the BPF
-  programs, sends test traffic, reads TUN packets, and verifies ringbuf events.
+  programs, sends test traffic, reads TUN packets, and verifies fwmark handling.
 - `docs/design.md`: technical design notes, rejected alternatives, and
   limitations.
 
 ## Notes
 
-- PI mode is intentional. With `IFF_NO_PI`, TUN validates the first byte after
-  the virtio header as an IP version, so a raw 4-byte mark prefix can be rejected
-  before tc ingress gets a chance to strip it.
+- PI mode is intentional. The write path places a raw 4-byte mark after the
+  virtio header, and tc ingress strips it before the packet enters the stack.
 - `SO_RCVMARK` is not available on a TUN file descriptor because the fd is a
   character device from userspace's point of view.
-- The read-path side channel exports one mark per skb. For a GSO super-packet
-  that is the correct granularity: the whole skb has one `skb->mark`.
-- The event includes L4 protocol and ports so userspace can distinguish real
-  data events from control traffic such as ICMP errors, especially for mark `0`.
