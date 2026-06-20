@@ -688,6 +688,7 @@ func readUDPScalarFromTun(fd uintptr, meta *packetMeta) (int, error) {
 
 func readMPLSUDPFromTun(fd uintptr, expected uint32, meta *packetMeta) (int, error) {
 	buf := tunBufSmall
+	ipOffset := 4 + virtioNetHdrLen + 4
 	for i := 0; i < 256; i++ {
 		n, err := unix.Read(int(fd), buf)
 		if err != nil {
@@ -704,14 +705,16 @@ func readMPLSUDPFromTun(fd uintptr, expected uint32, meta *packetMeta) (int, err
 		if hdr.GSOType != virtioNetHdrGSONone {
 			continue
 		}
-		var mplsMeta mplsPacketMeta
-		if err := parseMPLSTunPacketMeta(buf[:n], &mplsMeta); err != nil {
-			continue
-		}
-		if mplsMeta.Mark != expected || mplsMeta.Packet.IPProto != ipProtoUDP {
+		mark := binary.BigEndian.Uint32(buf[4+virtioNetHdrLen : ipOffset])
+		ip := buf[ipOffset:]
+		if mark != expected || ip[0]>>4 != 4 || ip[9] != ipProtoUDP {
 			continue
 		}
 		if meta != nil {
+			var mplsMeta mplsPacketMeta
+			if err := parseMPLSTunPacketMeta(buf[:n], &mplsMeta); err != nil {
+				continue
+			}
 			*meta = mplsMeta.Packet
 		}
 		return n, nil
@@ -784,6 +787,7 @@ func readTCPControlFromTun(fd uintptr, packet *tcpPacket, requiredFlags uint8) e
 
 func readMPLSTCPFromTun(fd uintptr, expected uint32, packet *tcpPacket, requiredFlags uint8, requirePayload bool) (uint32, int, error) {
 	buf := tunBufTCP
+	ipOffset := 4 + virtioNetHdrLen + 4
 	var lastGSOType uint8
 	for i := 0; i < 512; i++ {
 		n, err := unix.Read(int(fd), buf)
@@ -802,16 +806,13 @@ func readMPLSTCPFromTun(fd uintptr, expected uint32, packet *tcpPacket, required
 		if hdr.GSOType != virtioNetHdrGSONone {
 			continue
 		}
-		var mplsMeta mplsPacketMeta
-		if err := parseMPLSTunPacketMeta(buf[:n], &mplsMeta); err != nil {
+		mark := binary.BigEndian.Uint32(buf[4+virtioNetHdrLen : ipOffset])
+		ip := buf[ipOffset:]
+		if mark != expected || ip[0]>>4 != 4 || ip[9] != ipProtoTCP {
 			continue
 		}
-		if mplsMeta.Mark != expected || mplsMeta.Packet.IPProto != ipProtoTCP {
-			continue
-		}
-		ip := buf[4+virtioNetHdrLen+4:]
 		ihl := int(ip[0]&0x0f) * 4
-		if ihl < 20 || n < 4+virtioNetHdrLen+4+ihl+20 {
+		if ihl < 20 || n < ipOffset+ihl+20 {
 			continue
 		}
 		tcp := ip[ihl:]
